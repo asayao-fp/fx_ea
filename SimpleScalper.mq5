@@ -3,19 +3,38 @@
 //|                        USDJPY専用 MAクロス スキャルピングEA       |
 //+------------------------------------------------------------------+
 #property copyright "SimpleScalper"
-#property version   "1.01"
+#property version   "1.02"
 #property strict
 
 #include <Trade\Trade.mqh>
 #include <Trade\PositionInfo.mqh>
 
+//--- ロットモード列挙型
+enum ENUM_LOT_MODE
+{
+    LOT_FIXED        = 0, // 固定ロット
+    LOT_RISK_PERCENT = 1  // リスク%ベース
+};
+
 //--- 入力パラメータ
 input string   InpSymbol       = "USDJPY";    // 取引通貨ペア（変更不可）
 input int      InpMagicNumber  = 20240001;    // マジックナンバー
-input double   InpLotSize      = 0.01;        // ロット数
+
+//--- ロット設定
+input ENUM_LOT_MODE InpLotMode    = LOT_FIXED; // ロットモード（Fixed/RiskPercent）
+input double   InpLotSize      = 0.01;        // 固定ロット数（LotMode=Fixed時）
+input double   InpRiskPercent  = 0.5;         // リスク%（LotMode=RiskPercent時）
+input double   InpMinLot       = 0.01;        // 最小ロット（RiskPercent時の下限）
+input double   InpMaxLot       = 1.0;         // 最大ロット（RiskPercent時の上限）
+
 input int      InpMaxPositions = 3;           // 最大同時ポジション数
 input int      InpTakeProfit   = 200;         // テイクプロフィット（ポイント）
 input int      InpStopLoss     = 100;         // ストップロス（ポイント）
+
+//--- 時間切れ決済
+input int      InpMaxBarsInTrade          = 8; // 最大保有バー数（0=無効）
+input int      InpTimeExitMinProfitPoints = 0;  // 時間切れ決済の最低含み益ポイント（0=無条件決済）
+
 input int      InpShortMaPeriod = 5;          // 短期MA期間
 input int      InpLongMaPeriod  = 20;         // 長期MA期間
 input ENUM_MA_METHOD InpMaMethod = MODE_EMA;  // MA計算方法
@@ -117,6 +136,102 @@ void ClosePositionsByType(ENUM_POSITION_TYPE posType)
 }
 
 //+------------------------------------------------------------------+
+//| ロット数を計算する（固定またはリスク%ベース）                     |
+//+------------------------------------------------------------------+
+double CalcLot(double slPoints)
+{
+    if (InpLotMode == LOT_FIXED)
+        return InpLotSize;
+
+    // リスク%ベースのロット計算
+    double balance  = AccountInfoDouble(ACCOUNT_BALANCE);
+    double riskAmt  = balance * InpRiskPercent / 100.0;
+    double tickVal  = SymbolInfoDouble(InpSymbol, SYMBOL_TRADE_TICK_VALUE);
+    double tickSize = SymbolInfoDouble(InpSymbol, SYMBOL_TRADE_TICK_SIZE);
+    double point    = SymbolInfoDouble(InpSymbol, SYMBOL_POINT);
+
+    if (tickVal <= 0 || tickSize <= 0 || slPoints <= 0)
+    {
+        if (VerboseLog)
+            Print("CalcLot: パラメータ異常 tickVal=", tickVal,
+                  " tickSize=", tickSize, " slPoints=", slPoints);
+        return InpMinLot;
+    }
+
+    // 1ロットあたりのSL損失額 = slPoints * (point/tickSize) * tickVal
+    double lossPerLot = slPoints * (point / tickSize) * tickVal;
+    double lot        = (lossPerLot > 0) ? riskAmt / lossPerLot : InpMinLot;
+
+    // ブローカーのボリューム制限に合わせて正規化
+    double volStep = SymbolInfoDouble(InpSymbol, SYMBOL_VOLUME_STEP);
+    double volMin  = SymbolInfoDouble(InpSymbol, SYMBOL_VOLUME_MIN);
+    double volMax  = SymbolInfoDouble(InpSymbol, SYMBOL_VOLUME_MAX);
+
+    if (volStep > 0)
+        lot = MathFloor(lot / volStep) * volStep;
+
+    double minLot = MathMax(InpMinLot, volMin);
+    double maxLot = MathMin(InpMaxLot, volMax);
+    lot = MathMax(lot, minLot);
+    lot = MathMin(lot, maxLot);
+
+    if (VerboseLog)
+        Print("CalcLot | Balance:", DoubleToString(balance, 2),
+              " | Risk%:", InpRiskPercent,
+              " | RiskAmt:", DoubleToString(riskAmt, 2),
+              " | LossPerLot:", DoubleToString(lossPerLot, 4),
+              " | Lot:", DoubleToString(lot, 2));
+    return lot;
+}
+
+//+------------------------------------------------------------------+
+//| 時間切れポジションを決済する（MaxBarsInTrade）                    |
+//+------------------------------------------------------------------+
+void CheckTimeExit()
+{
+    if (InpMaxBarsInTrade <= 0) return;
+
+    double point = SymbolInfoDouble(InpSymbol, SYMBOL_POINT);
+    for (int i = PositionsTotal() - 1; i >= 0; i--)
+    {
+        ulong ticket = PositionGetTicket(i);
+        if (ticket == 0) continue;
+        if (PositionGetString(POSITION_SYMBOL) != InpSymbol) continue;
+        if (PositionGetInteger(POSITION_MAGIC) != InpMagicNumber) continue;
+
+        datetime openTime    = (datetime)PositionGetInteger(POSITION_TIME);
+        int      barsElapsed = iBarShift(InpSymbol, PERIOD_CURRENT, openTime, false);
+        if (barsElapsed < 0) continue; // iBarShiftエラー時はスキップ
+        if (barsElapsed < InpMaxBarsInTrade) continue;
+
+        // 含み益条件チェック（TimeExitMinProfitPoints > 0 の場合）
+        if (InpTimeExitMinProfitPoints > 0)
+        {
+            double             openPrice    = PositionGetDouble(POSITION_PRICE_OPEN);
+            double             currentPrice = PositionGetDouble(POSITION_PRICE_CURRENT);
+            ENUM_POSITION_TYPE posType      = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+            double profitPoints = (posType == POSITION_TYPE_BUY)
+                                  ? (currentPrice - openPrice) / point
+                                  : (openPrice - currentPrice) / point;
+            if (profitPoints >= InpTimeExitMinProfitPoints)
+            {
+                if (VerboseLog)
+                    Print("時間切れ決済スキップ | Ticket:", ticket,
+                          " | 経過バー:", barsElapsed,
+                          " | 含み益:", DoubleToString(profitPoints, 1), "pts >= 閾値:", InpTimeExitMinProfitPoints);
+                continue;
+            }
+        }
+
+        if (VerboseLog)
+            Print("時間切れ決済 | Ticket:", ticket,
+                  " | 経過バー:", barsElapsed,
+                  " | 理由: TimeExit");
+        Trade.PositionClose(ticket);
+    }
+}
+
+//+------------------------------------------------------------------+
 //| Expert initialization                                             |
 //+------------------------------------------------------------------+
 int OnInit()
@@ -134,9 +249,19 @@ int OnInit()
         Alert("短期MA期間は長期MA期間より小さくしてください。");
         return INIT_FAILED;
     }
-    if (InpLotSize <= 0 || InpTakeProfit <= 0 || InpStopLoss <= 0)
+    if (InpLotMode == LOT_FIXED && InpLotSize <= 0)
     {
-        Alert("ロット数・TP・SLは正の値を設定してください。");
+        Alert("固定ロットモード: ロット数は正の値を設定してください。");
+        return INIT_FAILED;
+    }
+    if (InpLotMode == LOT_RISK_PERCENT && (InpRiskPercent <= 0 || InpRiskPercent > 100))
+    {
+        Alert("リスク%モード: RiskPercentは0より大きく100以下に設定してください。");
+        return INIT_FAILED;
+    }
+    if (InpTakeProfit <= 0 || InpStopLoss <= 0)
+    {
+        Alert("TP・SLは正の値を設定してください。");
         return INIT_FAILED;
     }
 
@@ -157,8 +282,14 @@ int OnInit()
     datetime serverNow = TimeCurrent();
     datetime utcNow    = serverNow - ServerUtcOffsetHours * 3600;
     datetime jstNow    = ServerTimeToJST(serverNow);
+    string lotInfo = (InpLotMode == LOT_FIXED)
+                     ? ("FixedLot:" + DoubleToString(InpLotSize, 2))
+                     : ("RiskPercent:" + DoubleToString(InpRiskPercent, 2) + "%");
     Print("SimpleScalper 初期化完了 | Magic:", InpMagicNumber,
-          " | Lot:", InpLotSize, " | TP:", InpTakeProfit, " | SL:", InpStopLoss);
+          " | LotMode:", (InpLotMode == LOT_FIXED ? "Fixed" : "RiskPercent"),
+          " | ", lotInfo,
+          " | TP:", InpTakeProfit, " | SL:", InpStopLoss,
+          " | MaxBarsInTrade:", InpMaxBarsInTrade);
     Print("時刻情報 | Server:", TimeToString(serverNow, TIME_DATE|TIME_MINUTES),
           " | UTC:", TimeToString(utcNow, TIME_DATE|TIME_MINUTES),
           " | JST:", TimeToString(jstNow, TIME_DATE|TIME_MINUTES),
@@ -187,6 +318,9 @@ void OnTick()
     datetime currentBarTime = iTime(InpSymbol, PERIOD_CURRENT, 0);
     if (currentBarTime == lastBarTime) return;
     lastBarTime = currentBarTime;
+
+    // 時間切れ決済チェック
+    CheckTimeExit();
 
     // 価格情報取得
     double point  = SymbolInfoDouble(InpSymbol, SYMBOL_POINT);
@@ -265,12 +399,23 @@ void OnTick()
 
         if (CountPositions() < InpMaxPositions)
         {
-            double sl = ask - InpStopLoss   * point;
-            double tp = ask + InpTakeProfit * point;
-            if (Trade.Buy(InpLotSize, InpSymbol, ask, sl, tp, "SimpleScalper Buy"))
+            double sl  = ask - InpStopLoss   * point;
+            double tp  = ask + InpTakeProfit * point;
+            double lot = CalcLot(InpStopLoss);
+            double margin = 0;
+            if (!OrderCalcMargin(ORDER_TYPE_BUY, InpSymbol, lot, ask, margin) ||
+                AccountInfoDouble(ACCOUNT_FREEMARGIN) < margin)
+            {
+                if (VerboseLog)
+                    Print("エントリー見送り | 理由: 証拠金不足 | Lot:", DoubleToString(lot, 2),
+                          " | 必要証拠金:", DoubleToString(margin, 2),
+                          " | 余剰証拠金:", DoubleToString(AccountInfoDouble(ACCOUNT_FREEMARGIN), 2));
+            }
+            else if (Trade.Buy(lot, InpSymbol, ask, sl, tp, "SimpleScalper Buy"))
                 Print("エントリー実行 | BUY | Ask:", DoubleToString(ask, (int)SymbolInfoInteger(InpSymbol, SYMBOL_DIGITS)),
                       " | SL:", DoubleToString(sl, (int)SymbolInfoInteger(InpSymbol, SYMBOL_DIGITS)),
-                      " | TP:", DoubleToString(tp, (int)SymbolInfoInteger(InpSymbol, SYMBOL_DIGITS)));
+                      " | TP:", DoubleToString(tp, (int)SymbolInfoInteger(InpSymbol, SYMBOL_DIGITS)),
+                      " | Lot:", DoubleToString(lot, 2));
         }
         else
         {
@@ -285,12 +430,23 @@ void OnTick()
 
         if (CountPositions() < InpMaxPositions)
         {
-            double sl = bid + InpStopLoss   * point;
-            double tp = bid - InpTakeProfit * point;
-            if (Trade.Sell(InpLotSize, InpSymbol, bid, sl, tp, "SimpleScalper Sell"))
+            double sl  = bid + InpStopLoss   * point;
+            double tp  = bid - InpTakeProfit * point;
+            double lot = CalcLot(InpStopLoss);
+            double margin = 0;
+            if (!OrderCalcMargin(ORDER_TYPE_SELL, InpSymbol, lot, bid, margin) ||
+                AccountInfoDouble(ACCOUNT_FREEMARGIN) < margin)
+            {
+                if (VerboseLog)
+                    Print("エントリー見送り | 理由: 証拠金不足 | Lot:", DoubleToString(lot, 2),
+                          " | 必要証拠金:", DoubleToString(margin, 2),
+                          " | 余剰証拠金:", DoubleToString(AccountInfoDouble(ACCOUNT_FREEMARGIN), 2));
+            }
+            else if (Trade.Sell(lot, InpSymbol, bid, sl, tp, "SimpleScalper Sell"))
                 Print("エントリー実行 | SELL | Bid:", DoubleToString(bid, (int)SymbolInfoInteger(InpSymbol, SYMBOL_DIGITS)),
                       " | SL:", DoubleToString(sl, (int)SymbolInfoInteger(InpSymbol, SYMBOL_DIGITS)),
-                      " | TP:", DoubleToString(tp, (int)SymbolInfoInteger(InpSymbol, SYMBOL_DIGITS)));
+                      " | TP:", DoubleToString(tp, (int)SymbolInfoInteger(InpSymbol, SYMBOL_DIGITS)),
+                      " | Lot:", DoubleToString(lot, 2));
         }
         else
         {
