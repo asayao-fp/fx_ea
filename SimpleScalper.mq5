@@ -3,7 +3,7 @@
 //|                        USDJPY専用 MAクロス スキャルピングEA       |
 //+------------------------------------------------------------------+
 #property copyright "SimpleScalper"
-#property version   "1.00"
+#property version   "1.01"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -20,21 +20,60 @@ input int      InpShortMaPeriod = 5;          // 短期MA期間
 input int      InpLongMaPeriod  = 20;         // 長期MA期間
 input ENUM_MA_METHOD InpMaMethod = MODE_EMA;  // MA計算方法
 
+//--- JST時間帯変換パラメータ
+input bool     UseJST               = true;   // JST基準で時間帯判定する
+input int      ServerUtcOffsetHours = 2;      // サーバ時間のUTCオフセット（時間）
+input int      JSTUtcOffsetHours    = 9;      // JSTのUTCオフセット（時間、通常9）
+
+//--- スプレッドフィルタ
+input int      MaxSpreadPoints = 30;          // 最大許容スプレッド（ポイント）
+
+//--- ログ
+input bool     VerboseLog = true;             // 詳細ログを出力する
+
 //--- グローバル変数
 CTrade  Trade;
 int     g_shortMaHandle = INVALID_HANDLE;
 int     g_longMaHandle  = INVALID_HANDLE;
 
 //+------------------------------------------------------------------+
+//| サーバ時刻をJST時刻に変換してdatetimeを返す                      |
+//+------------------------------------------------------------------+
+datetime ServerTimeToJST(datetime serverTime)
+{
+    // サーバ時刻 → UTC → JST
+    datetime utcTime = serverTime - ServerUtcOffsetHours * 3600;
+    return utcTime + JSTUtcOffsetHours * 3600;
+}
+
+//+------------------------------------------------------------------+
+//| 現在のJST時刻の「時」を返す                                       |
+//+------------------------------------------------------------------+
+int GetCurrentJSTHour()
+{
+    MqlDateTime dt;
+    TimeToStruct(ServerTimeToJST(TimeCurrent()), dt);
+    return dt.hour;
+}
+
+//+------------------------------------------------------------------+
 //| 取引時間帯チェック                                                |
 //+------------------------------------------------------------------+
 bool IsTradeTime()
 {
-    MqlDateTime dt;
-    TimeToStruct(TimeCurrent(), dt);
-    int hour = dt.hour;
+    int hour;
+    if (UseJST)
+    {
+        hour = GetCurrentJSTHour();
+    }
+    else
+    {
+        MqlDateTime dt;
+        TimeToStruct(TimeCurrent(), dt);
+        hour = dt.hour;
+    }
 
-    // スキャルピング向け取引時間帯: 8-11, 16-18, 21-23
+    // スキャルピング向け取引時間帯(JST): 8-11, 16-18, 21-24
     if ((hour >= 8  && hour < 11) ||
         (hour >= 16 && hour < 18) ||
         (hour >= 21))
@@ -114,8 +153,18 @@ int OnInit()
     Trade.SetExpertMagicNumber(InpMagicNumber);
     Trade.SetDeviationInPoints(10);
 
+    // 起動時時刻ログ
+    datetime serverNow = TimeCurrent();
+    datetime utcNow    = serverNow - ServerUtcOffsetHours * 3600;
+    datetime jstNow    = ServerTimeToJST(serverNow);
     Print("SimpleScalper 初期化完了 | Magic:", InpMagicNumber,
           " | Lot:", InpLotSize, " | TP:", InpTakeProfit, " | SL:", InpStopLoss);
+    Print("時刻情報 | Server:", TimeToString(serverNow, TIME_DATE|TIME_MINUTES),
+          " | UTC:", TimeToString(utcNow, TIME_DATE|TIME_MINUTES),
+          " | JST:", TimeToString(jstNow, TIME_DATE|TIME_MINUTES),
+          " | UseJST:", (UseJST ? "true" : "false"),
+          " | ServerUtcOffset:", ServerUtcOffsetHours, "h");
+    Print("取引時間帯判定 | 現在取引可能:", (IsTradeTime() ? "YES" : "NO"));
     return INIT_SUCCEEDED;
 }
 
@@ -139,8 +188,40 @@ void OnTick()
     if (currentBarTime == lastBarTime) return;
     lastBarTime = currentBarTime;
 
+    // 価格情報取得
+    double point  = SymbolInfoDouble(InpSymbol, SYMBOL_POINT);
+    double ask    = SymbolInfoDouble(InpSymbol, SYMBOL_ASK);
+    double bid    = SymbolInfoDouble(InpSymbol, SYMBOL_BID);
+    int    spread = (point > 0) ? (int)MathRound((ask - bid) / point) : 0;
+
     // 取引時間帯チェック
-    if (!IsTradeTime()) return;
+    bool inTradeTime = IsTradeTime();
+
+    // VerboseLog: 基本情報出力
+    if (VerboseLog)
+    {
+        datetime serverNow = TimeCurrent();
+        datetime jstNow    = ServerTimeToJST(serverNow);
+        Print("=== 新バー判定 | JST:", TimeToString(jstNow, TIME_DATE|TIME_MINUTES),
+              " | ", InpSymbol,
+              " | Bid:", DoubleToString(bid, (int)SymbolInfoInteger(InpSymbol, SYMBOL_DIGITS)),
+              " | Ask:", DoubleToString(ask, (int)SymbolInfoInteger(InpSymbol, SYMBOL_DIGITS)),
+              " | Spread:", spread, "pts",
+              " | 取引時間帯:", (inTradeTime ? "YES" : "NO"));
+    }
+
+    if (!inTradeTime)
+    {
+        if (VerboseLog) Print("エントリー見送り | 理由: 取引時間外");
+        return;
+    }
+
+    // スプレッドフィルタ
+    if (spread > MaxSpreadPoints)
+    {
+        if (VerboseLog) Print("エントリー見送り | 理由: スプレッド超過 | Spread:", spread, "pts > MaxSpread:", MaxSpreadPoints, "pts");
+        return;
+    }
 
     // MAバッファ取得（直近2本分）
     double shortMa[2], longMa[2];
@@ -164,9 +245,18 @@ void OnTick()
     bool buySignal  = (shortMaPrev <= longMaPrev) && (shortMaCurr > longMaCurr);
     bool sellSignal = (shortMaPrev >= longMaPrev) && (shortMaCurr < longMaCurr);
 
-    double point = SymbolInfoDouble(InpSymbol, SYMBOL_POINT);
-    double ask   = SymbolInfoDouble(InpSymbol, SYMBOL_ASK);
-    double bid   = SymbolInfoDouble(InpSymbol, SYMBOL_BID);
+    // VerboseLog: MA値とクロス方向
+    if (VerboseLog)
+    {
+        string crossDir = "なし";
+        if (buySignal)  crossDir = "ゴールデンクロス(買い)";
+        if (sellSignal) crossDir = "デッドクロス(売り)";
+        Print("MA情報 | FastMA(前):", DoubleToString(shortMaPrev, 5),
+              " FastMA(現):", DoubleToString(shortMaCurr, 5),
+              " | SlowMA(前):", DoubleToString(longMaPrev, 5),
+              " SlowMA(現):", DoubleToString(longMaCurr, 5),
+              " | クロス:", crossDir);
+    }
 
     // 買いシグナル: 売りポジションを逆シグナル決済 → 買いエントリー
     if (buySignal)
@@ -177,7 +267,14 @@ void OnTick()
         {
             double sl = ask - InpStopLoss   * point;
             double tp = ask + InpTakeProfit * point;
-            Trade.Buy(InpLotSize, InpSymbol, ask, sl, tp, "SimpleScalper Buy");
+            if (Trade.Buy(InpLotSize, InpSymbol, ask, sl, tp, "SimpleScalper Buy"))
+                Print("エントリー実行 | BUY | Ask:", DoubleToString(ask, (int)SymbolInfoInteger(InpSymbol, SYMBOL_DIGITS)),
+                      " | SL:", DoubleToString(sl, (int)SymbolInfoInteger(InpSymbol, SYMBOL_DIGITS)),
+                      " | TP:", DoubleToString(tp, (int)SymbolInfoInteger(InpSymbol, SYMBOL_DIGITS)));
+        }
+        else
+        {
+            if (VerboseLog) Print("エントリー見送り | 理由: 最大ポジション数上限 | ポジション数:", CountPositions());
         }
     }
 
@@ -190,8 +287,18 @@ void OnTick()
         {
             double sl = bid + InpStopLoss   * point;
             double tp = bid - InpTakeProfit * point;
-            Trade.Sell(InpLotSize, InpSymbol, bid, sl, tp, "SimpleScalper Sell");
+            if (Trade.Sell(InpLotSize, InpSymbol, bid, sl, tp, "SimpleScalper Sell"))
+                Print("エントリー実行 | SELL | Bid:", DoubleToString(bid, (int)SymbolInfoInteger(InpSymbol, SYMBOL_DIGITS)),
+                      " | SL:", DoubleToString(sl, (int)SymbolInfoInteger(InpSymbol, SYMBOL_DIGITS)),
+                      " | TP:", DoubleToString(tp, (int)SymbolInfoInteger(InpSymbol, SYMBOL_DIGITS)));
+        }
+        else
+        {
+            if (VerboseLog) Print("エントリー見送り | 理由: 最大ポジション数上限 | ポジション数:", CountPositions());
         }
     }
+
+    if (VerboseLog && !buySignal && !sellSignal)
+        Print("エントリー見送り | 理由: MAクロスシグナルなし");
 }
 //+------------------------------------------------------------------+
