@@ -8,6 +8,7 @@
 
 #include <Trade\Trade.mqh>
 #include <Trade\PositionInfo.mqh>
+#include "Logger.mqh"
 
 //--- ロットモード列挙型
 enum ENUM_LOT_MODE
@@ -48,12 +49,20 @@ input int      JSTUtcOffsetHours    = 9;      // JSTのUTCオフセット（時�
 input int      MaxSpreadPoints = 30;          // 最大許容スプレッド（ポイント）
 
 //--- ログ
-input bool     VerboseLog = true;             // 詳細ログを出力する
+input bool     VerboseLog = true;             // 詳細ログを出力する（既存の詳細ログ）
+
+//--- 分析ログ設定
+input bool   EnableCsvLogging        = true;              // CSVログを出力する（MQL5/Files に保存）
+input bool   EnablePrintLogging      = true;              // Expertsタブに構造化ログを出力する
+input string LogFileName             = "SimpleScalper";   // CSVファイル名プレフィックス
+input int    LogLevel                = 1;                 // ログレベル（0=エラーのみ, 1=取引, 2=詳細）
+input bool   UseServerTimeForSessions = false;            // セッション判定にサーバ時刻を使用（false=UseJST設定を使用）
 
 //--- グローバル変数
 CTrade  Trade;
 int     g_shortMaHandle = INVALID_HANDLE;
 int     g_longMaHandle  = INVALID_HANDLE;
+CLogger g_logger;
 
 //+------------------------------------------------------------------+
 //| サーバ時刻をJST時刻に変換してdatetimeを返す                      |
@@ -76,21 +85,47 @@ int GetCurrentJSTHour()
 }
 
 //+------------------------------------------------------------------+
+//| セッション判定に使う「時」を返す                                  |
+//| UseServerTimeForSessions=true → サーバ時刻                       |
+//| false かつ UseJST=true       → JST変換後の時刻                   |
+//| false かつ UseJST=false      → サーバ時刻                        |
+//+------------------------------------------------------------------+
+int GetSessionHour()
+{
+    if (UseServerTimeForSessions)
+    {
+        MqlDateTime dt;
+        TimeToStruct(TimeCurrent(), dt);
+        return dt.hour;
+    }
+    if (UseJST)
+        return GetCurrentJSTHour();
+    MqlDateTime dt;
+    TimeToStruct(TimeCurrent(), dt);
+    return dt.hour;
+}
+
+//+------------------------------------------------------------------+
+//| セッション状態文字列を返す（ログ用）                              |
+//| 例: "IN:08:00-11:00(JST)" / "OUT(server)"                        |
+//+------------------------------------------------------------------+
+string GetSessionState()
+{
+    int    hour     = GetSessionHour();
+    string timeBase = UseServerTimeForSessions ? "server" : (UseJST ? "JST" : "server");
+
+    if (hour >= 8  && hour < 11) return "IN:08:00-11:00(" + timeBase + ")";
+    if (hour >= 16 && hour < 18) return "IN:16:00-18:00(" + timeBase + ")";
+    if (hour >= 21)              return "IN:21:00-24:00(" + timeBase + ")";
+    return "OUT(" + timeBase + ")";
+}
+
+//+------------------------------------------------------------------+
 //| 取引時間帯チェック                                                |
 //+------------------------------------------------------------------+
 bool IsTradeTime()
 {
-    int hour;
-    if (UseJST)
-    {
-        hour = GetCurrentJSTHour();
-    }
-    else
-    {
-        MqlDateTime dt;
-        TimeToStruct(TimeCurrent(), dt);
-        hour = dt.hour;
-    }
+    int hour = GetSessionHour();
 
     // スキャルピング向け取引時間帯(JST): 8-11, 16-18, 21-24
     if ((hour >= 8  && hour < 11) ||
@@ -120,7 +155,8 @@ int CountPositions()
 //+------------------------------------------------------------------+
 //| 指定方向のポジションを全決済（逆シグナル決済）                    |
 //+------------------------------------------------------------------+
-void ClosePositionsByType(ENUM_POSITION_TYPE posType)
+void ClosePositionsByType(ENUM_POSITION_TYPE posType,
+                          const string closeReason = "REVERSE_SIGNAL")
 {
     for (int i = PositionsTotal() - 1; i >= 0; i--)
     {
@@ -130,7 +166,18 @@ void ClosePositionsByType(ENUM_POSITION_TYPE posType)
             PositionGetInteger(POSITION_MAGIC) == InpMagicNumber &&
             (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) == posType)
         {
-            Trade.PositionClose(ticket);
+            bool ok = Trade.PositionClose(ticket);
+
+            SLogEntry e;
+            e.event_type      = "EXIT";
+            e.side            = (posType == POSITION_TYPE_BUY) ? "BUY" : "SELL";
+            e.reason          = closeReason;
+            e.position_ticket = ticket;
+            e.retcode         = Trade.ResultRetcode();
+            e.deal_ticket     = (ok ? Trade.ResultDeal() : 0);
+            e.last_error      = (ok ? 0 : GetLastError());
+            e.session_state   = GetSessionState();
+            g_logger.LogEvent(LOG_LEVEL_TRADES, e);
         }
     }
 }
@@ -199,6 +246,9 @@ void CheckTimeExit()
         if (PositionGetString(POSITION_SYMBOL) != InpSymbol) continue;
         if (PositionGetInteger(POSITION_MAGIC) != InpMagicNumber) continue;
 
+        // ポジション方向を先に取得（Close後は参照不可）
+        ENUM_POSITION_TYPE posTypeForLog = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+
         datetime openTime    = (datetime)PositionGetInteger(POSITION_TIME);
         int      barsElapsed = iBarShift(InpSymbol, PERIOD_CURRENT, openTime, false);
         if (barsElapsed < 0) continue; // iBarShiftエラー時はスキップ
@@ -227,7 +277,19 @@ void CheckTimeExit()
             Print("時間切れ決済 | Ticket:", ticket,
                   " | 経過バー:", barsElapsed,
                   " | 理由: TimeExit");
-        Trade.PositionClose(ticket);
+
+        bool ok = Trade.PositionClose(ticket);
+
+        SLogEntry e;
+        e.event_type      = "EXIT";
+        e.side            = (posTypeForLog == POSITION_TYPE_BUY) ? "BUY" : "SELL";
+        e.reason          = "TIME_EXIT";
+        e.position_ticket = ticket;
+        e.retcode         = Trade.ResultRetcode();
+        e.deal_ticket     = (ok ? Trade.ResultDeal() : 0);
+        e.last_error      = (ok ? 0 : GetLastError());
+        e.session_state   = GetSessionState();
+        g_logger.LogEvent(LOG_LEVEL_TRADES, e);
     }
 }
 
@@ -278,6 +340,11 @@ int OnInit()
     Trade.SetExpertMagicNumber(InpMagicNumber);
     Trade.SetDeviationInPoints(10);
 
+    // ロガー初期化
+    g_logger.Init(EnableCsvLogging, EnablePrintLogging, LogLevel,
+                  LogFileName, InpSymbol, PERIOD_CURRENT,
+                  InpShortMaPeriod, InpLongMaPeriod);
+
     // 起動時時刻ログ
     datetime serverNow = TimeCurrent();
     datetime utcNow    = serverNow - ServerUtcOffsetHours * 3600;
@@ -294,8 +361,18 @@ int OnInit()
           " | UTC:", TimeToString(utcNow, TIME_DATE|TIME_MINUTES),
           " | JST:", TimeToString(jstNow, TIME_DATE|TIME_MINUTES),
           " | UseJST:", (UseJST ? "true" : "false"),
+          " | UseServerTimeForSessions:", (UseServerTimeForSessions ? "true" : "false"),
           " | ServerUtcOffset:", ServerUtcOffsetHours, "h");
-    Print("取引時間帯判定 | 現在取引可能:", (IsTradeTime() ? "YES" : "NO"));
+    Print("取引時間帯判定 | 現在取引可能:", (IsTradeTime() ? "YES" : "NO"),
+          " | セッション:", GetSessionState());
+
+    // INIT イベントをログに記録
+    SLogEntry initEntry;
+    initEntry.event_type  = "INIT";
+    initEntry.reason      = "EA_START";
+    initEntry.session_state = GetSessionState();
+    g_logger.LogEvent(LOG_LEVEL_TRADES, initEntry);
+
     return INIT_SUCCEEDED;
 }
 
@@ -304,8 +381,14 @@ int OnInit()
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
+    SLogEntry e;
+    e.event_type = "DEINIT";
+    e.reason     = "reason_code=" + IntegerToString(reason);
+    g_logger.LogEvent(LOG_LEVEL_TRADES, e);
+
     if (g_shortMaHandle != INVALID_HANDLE) IndicatorRelease(g_shortMaHandle);
     if (g_longMaHandle  != INVALID_HANDLE) IndicatorRelease(g_longMaHandle);
+    g_logger.Deinit();
 }
 
 //+------------------------------------------------------------------+
@@ -328,8 +411,9 @@ void OnTick()
     double bid    = SymbolInfoDouble(InpSymbol, SYMBOL_BID);
     int    spread = (point > 0) ? (int)MathRound((ask - bid) / point) : 0;
 
-    // 取引時間帯チェック
-    bool inTradeTime = IsTradeTime();
+    // 取引時間帯チェック（GetSessionState()も含めて1回だけ評価）
+    bool   inTradeTime  = IsTradeTime();
+    string sessionState = GetSessionState();
 
     // VerboseLog: 基本情報出力
     if (VerboseLog)
@@ -341,12 +425,33 @@ void OnTick()
               " | Bid:", DoubleToString(bid, (int)SymbolInfoInteger(InpSymbol, SYMBOL_DIGITS)),
               " | Ask:", DoubleToString(ask, (int)SymbolInfoInteger(InpSymbol, SYMBOL_DIGITS)),
               " | Spread:", spread, "pts",
-              " | 取引時間帯:", (inTradeTime ? "YES" : "NO"));
+              " | 取引時間帯:", (inTradeTime ? "YES" : "NO"),
+              " | セッション:", sessionState);
+    }
+
+    // NEW_BAR イベント（詳細レベル）
+    {
+        SLogEntry e;
+        e.event_type    = "NEW_BAR";
+        e.price_bid     = bid;
+        e.price_ask     = ask;
+        e.spread_points = spread;
+        e.session_state = sessionState;
+        g_logger.LogEvent(LOG_LEVEL_VERBOSE, e);
     }
 
     if (!inTradeTime)
     {
         if (VerboseLog) Print("エントリー見送り | 理由: 取引時間外");
+
+        SLogEntry e;
+        e.event_type    = "SKIP_TIME";
+        e.reason        = "OUT_OF_SESSION";
+        e.price_bid     = bid;
+        e.price_ask     = ask;
+        e.spread_points = spread;
+        e.session_state = sessionState;
+        g_logger.LogEvent(LOG_LEVEL_TRADES, e);
         return;
     }
 
@@ -354,6 +459,15 @@ void OnTick()
     if (spread > MaxSpreadPoints)
     {
         if (VerboseLog) Print("エントリー見送り | 理由: スプレッド超過 | Spread:", spread, "pts > MaxSpread:", MaxSpreadPoints, "pts");
+
+        SLogEntry e;
+        e.event_type    = "SKIP_SYMBOL";
+        e.reason        = "SPREAD_TOO_HIGH";
+        e.price_bid     = bid;
+        e.price_ask     = ask;
+        e.spread_points = spread;
+        e.session_state = sessionState;
+        g_logger.LogEvent(LOG_LEVEL_TRADES, e);
         return;
     }
 
@@ -362,11 +476,23 @@ void OnTick()
     if (CopyBuffer(g_shortMaHandle, 0, 1, 2, shortMa) < 2)
     {
         Print("短期MAデータの取得に失敗しました。");
+        SLogEntry e;
+        e.event_type  = "ERROR";
+        e.reason      = "MA_BUFFER_COPY_FAIL";
+        e.last_error  = GetLastError();
+        e.session_state = sessionState;
+        g_logger.LogEvent(LOG_LEVEL_ERRORS, e);
         return;
     }
     if (CopyBuffer(g_longMaHandle,  0, 1, 2, longMa)  < 2)
     {
         Print("長期MAデータの取得に失敗しました。");
+        SLogEntry e;
+        e.event_type  = "ERROR";
+        e.reason      = "MA_BUFFER_COPY_FAIL";
+        e.last_error  = GetLastError();
+        e.session_state = sessionState;
+        g_logger.LogEvent(LOG_LEVEL_ERRORS, e);
         return;
     }
 
@@ -392,6 +518,22 @@ void OnTick()
               " | クロス:", crossDir);
     }
 
+    // SIGNAL イベント（シグナルあり時のみ、詳細レベル）
+    if (buySignal || sellSignal)
+    {
+        SLogEntry e;
+        e.event_type    = "SIGNAL";
+        e.side          = buySignal ? "BUY" : "SELL";
+        e.reason        = buySignal ? "MA_CROSS_UP" : "MA_CROSS_DOWN";
+        e.fast_ma_value = shortMaCurr;
+        e.slow_ma_value = longMaCurr;
+        e.price_bid     = bid;
+        e.price_ask     = ask;
+        e.spread_points = spread;
+        e.session_state = sessionState;
+        g_logger.LogEvent(LOG_LEVEL_VERBOSE, e);
+    }
+
     // 買いシグナル: 売りポジションを逆シグナル決済 → 買いエントリー
     if (buySignal)
     {
@@ -410,12 +552,48 @@ void OnTick()
                     Print("エントリー見送り | 理由: 証拠金不足 | Lot:", DoubleToString(lot, 2),
                           " | 必要証拠金:", DoubleToString(margin, 2),
                           " | 余剰証拠金:", DoubleToString(AccountInfoDouble(ACCOUNT_FREEMARGIN), 2));
+
+                SLogEntry e;
+                e.event_type    = "SKIP_SYMBOL";
+                e.side          = "BUY";
+                e.reason        = "INSUFFICIENT_MARGIN";
+                e.fast_ma_value = shortMaCurr;
+                e.slow_ma_value = longMaCurr;
+                e.price_bid     = bid;
+                e.price_ask     = ask;
+                e.spread_points = spread;
+                e.lot           = lot;
+                e.session_state = sessionState;
+                g_logger.LogEvent(LOG_LEVEL_TRADES, e);
             }
-            else if (Trade.Buy(lot, InpSymbol, ask, sl, tp, "SimpleScalper Buy"))
-                Print("エントリー実行 | BUY | Ask:", DoubleToString(ask, (int)SymbolInfoInteger(InpSymbol, SYMBOL_DIGITS)),
-                      " | SL:", DoubleToString(sl, (int)SymbolInfoInteger(InpSymbol, SYMBOL_DIGITS)),
-                      " | TP:", DoubleToString(tp, (int)SymbolInfoInteger(InpSymbol, SYMBOL_DIGITS)),
-                      " | Lot:", DoubleToString(lot, 2));
+            else
+            {
+                bool ok = Trade.Buy(lot, InpSymbol, ask, sl, tp, "SimpleScalper Buy");
+                if (ok)
+                    Print("エントリー実行 | BUY | Ask:", DoubleToString(ask, (int)SymbolInfoInteger(InpSymbol, SYMBOL_DIGITS)),
+                          " | SL:", DoubleToString(sl, (int)SymbolInfoInteger(InpSymbol, SYMBOL_DIGITS)),
+                          " | TP:", DoubleToString(tp, (int)SymbolInfoInteger(InpSymbol, SYMBOL_DIGITS)),
+                          " | Lot:", DoubleToString(lot, 2));
+
+                SLogEntry e;
+                e.event_type    = ok ? "ENTRY" : "ERROR";
+                e.side          = "BUY";
+                e.reason        = ok ? "MA_CROSS_UP" : "ORDER_SEND_FAIL";
+                e.fast_ma_value = shortMaCurr;
+                e.slow_ma_value = longMaCurr;
+                e.price_bid     = bid;
+                e.price_ask     = ask;
+                e.spread_points = spread;
+                e.lot           = lot;
+                e.sl_price      = sl;
+                e.tp_price      = tp;
+                e.order_ticket  = Trade.ResultOrder();
+                e.deal_ticket   = Trade.ResultDeal();
+                e.retcode       = Trade.ResultRetcode();
+                e.last_error    = (ok ? 0 : GetLastError());
+                e.session_state = sessionState;
+                g_logger.LogEvent(ok ? LOG_LEVEL_TRADES : LOG_LEVEL_ERRORS, e);
+            }
         }
         else
         {
@@ -441,12 +619,48 @@ void OnTick()
                     Print("エントリー見送り | 理由: 証拠金不足 | Lot:", DoubleToString(lot, 2),
                           " | 必要証拠金:", DoubleToString(margin, 2),
                           " | 余剰証拠金:", DoubleToString(AccountInfoDouble(ACCOUNT_FREEMARGIN), 2));
+
+                SLogEntry e;
+                e.event_type    = "SKIP_SYMBOL";
+                e.side          = "SELL";
+                e.reason        = "INSUFFICIENT_MARGIN";
+                e.fast_ma_value = shortMaCurr;
+                e.slow_ma_value = longMaCurr;
+                e.price_bid     = bid;
+                e.price_ask     = ask;
+                e.spread_points = spread;
+                e.lot           = lot;
+                e.session_state = sessionState;
+                g_logger.LogEvent(LOG_LEVEL_TRADES, e);
             }
-            else if (Trade.Sell(lot, InpSymbol, bid, sl, tp, "SimpleScalper Sell"))
-                Print("エントリー実行 | SELL | Bid:", DoubleToString(bid, (int)SymbolInfoInteger(InpSymbol, SYMBOL_DIGITS)),
-                      " | SL:", DoubleToString(sl, (int)SymbolInfoInteger(InpSymbol, SYMBOL_DIGITS)),
-                      " | TP:", DoubleToString(tp, (int)SymbolInfoInteger(InpSymbol, SYMBOL_DIGITS)),
-                      " | Lot:", DoubleToString(lot, 2));
+            else
+            {
+                bool ok = Trade.Sell(lot, InpSymbol, bid, sl, tp, "SimpleScalper Sell");
+                if (ok)
+                    Print("エントリー実行 | SELL | Bid:", DoubleToString(bid, (int)SymbolInfoInteger(InpSymbol, SYMBOL_DIGITS)),
+                          " | SL:", DoubleToString(sl, (int)SymbolInfoInteger(InpSymbol, SYMBOL_DIGITS)),
+                          " | TP:", DoubleToString(tp, (int)SymbolInfoInteger(InpSymbol, SYMBOL_DIGITS)),
+                          " | Lot:", DoubleToString(lot, 2));
+
+                SLogEntry e;
+                e.event_type    = ok ? "ENTRY" : "ERROR";
+                e.side          = "SELL";
+                e.reason        = ok ? "MA_CROSS_DOWN" : "ORDER_SEND_FAIL";
+                e.fast_ma_value = shortMaCurr;
+                e.slow_ma_value = longMaCurr;
+                e.price_bid     = bid;
+                e.price_ask     = ask;
+                e.spread_points = spread;
+                e.lot           = lot;
+                e.sl_price      = sl;
+                e.tp_price      = tp;
+                e.order_ticket  = Trade.ResultOrder();
+                e.deal_ticket   = Trade.ResultDeal();
+                e.retcode       = Trade.ResultRetcode();
+                e.last_error    = (ok ? 0 : GetLastError());
+                e.session_state = sessionState;
+                g_logger.LogEvent(ok ? LOG_LEVEL_TRADES : LOG_LEVEL_ERRORS, e);
+            }
         }
         else
         {
