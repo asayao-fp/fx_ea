@@ -65,6 +65,16 @@ USDJPY専用・取引時間帯制限付き（JST対応）・MAクロスによる
 | `MaxSpreadPoints` | `30` | 新規エントリー時の最大許容スプレッド（ポイント） |
 | `VerboseLog` | `true` | 詳細ログをエキスパートタブに出力する |
 
+### 分析ログ設定
+
+| パラメータ | デフォルト | 説明 |
+|-----------|-----------|------|
+| `EnableCsvLogging` | `true` | CSVファイルへのログ出力を有効にする（`MQL5/Files/` に保存） |
+| `EnablePrintLogging` | `true` | Expertsタブへの構造化ログ出力を有効にする |
+| `LogFileName` | `SimpleScalper` | CSVファイル名のプレフィックス（日付が自動付与される） |
+| `LogLevel` | `1` | ログ出力レベル（`0`=エラーのみ, `1`=取引イベント, `2`=全詳細） |
+| `UseServerTimeForSessions` | `false` | `true` のとき取引時間帯判定にサーバ時刻を使用（`false` のとき `UseJST` 設定を使用） |
+
 > **注意**: USDJPYチャートの場合、1ポイント ≒ 0.001円相当（5桁ブローカーでは `100ポイント = 約1銭`）。
 
 ---
@@ -224,11 +234,117 @@ SimpleScalper 初期化完了 | Magic:20240001 | LotMode:RiskPercent | RiskPerce
 
 ---
 
+## 分析用ログ出力
+
+`EnableCsvLogging=true`（デフォルト）にすると、MT5のデータフォルダ内の `MQL5/Files/` に CSV ファイルが生成されます。
+
+### ファイルの場所
+
+- **Expertsタブ（Print ログ）**: MT5の「エキスパート」タブでリアルタイムに確認できます
+- **CSV ファイル**: MT5メニュー → **ファイル → データフォルダを開く** → `MQL5/Files/SimpleScalper_YYYYMMDD.csv`
+
+同じ日に再起動した場合は、既存ファイルの末尾に追記されます。
+
+### CSV 列の説明
+
+| 列名 | 説明 |
+|------|------|
+| `timestamp_server` | サーバ時刻（`TimeTradeServer`相当） |
+| `timestamp_local` | ローカル時刻（`TimeLocal`） |
+| `symbol` | 取引通貨ペア |
+| `timeframe` | 稼働時間足（例: `PERIOD_M5`） |
+| `event_type` | イベント種別（下表参照） |
+| `side` | 売買方向（`BUY` / `SELL` / `NONE`） |
+| `reason` | イベント理由（下表参照） |
+| `fast_ma_period` | 短期MA期間（EA設定値） |
+| `slow_ma_period` | 長期MA期間（EA設定値） |
+| `fast_ma_value` | 判定に使った短期MA値 |
+| `slow_ma_value` | 判定に使った長期MA値 |
+| `price_bid` | Bid 価格 |
+| `price_ask` | Ask 価格 |
+| `spread_points` | スプレッド（ポイント） |
+| `lot` | ロット数 |
+| `sl_price` | ストップロス価格 |
+| `tp_price` | テイクプロフィット価格 |
+| `order_ticket` | 注文チケット番号 |
+| `position_ticket` | ポジションチケット番号 |
+| `deal_ticket` | 約定チケット番号 |
+| `retcode` | 注文送信の戻りコード（10009=成功） |
+| `last_error` | エラー時の `GetLastError()` 値 |
+| `session_state` | セッション判定結果（例: `IN:08:00-11:00(JST)` / `OUT(server)`） |
+
+### event_type 一覧
+
+| event_type | 説明 |
+|-----------|------|
+| `INIT` | EA初期化完了 |
+| `DEINIT` | EA終了 |
+| `NEW_BAR` | 新規バー確定（`LogLevel=2` のみ出力） |
+| `SIGNAL` | MAクロスシグナル検出（`LogLevel=2` のみ出力） |
+| `ENTRY` | エントリー注文送信成功 |
+| `EXIT` | ポジション決済 |
+| `SKIP_TIME` | 取引時間外のためスキップ |
+| `SKIP_SYMBOL` | スプレッド超過または証拠金不足のためスキップ |
+| `ERROR` | 注文失敗・MAデータ取得失敗などのエラー |
+
+### reason 一覧
+
+| reason | 説明 |
+|--------|------|
+| `MA_CROSS_UP` | ゴールデンクロス（買いシグナル） |
+| `MA_CROSS_DOWN` | デッドクロス（売りシグナル） |
+| `REVERSE_SIGNAL` | 逆シグナルによるポジション決済 |
+| `TIME_EXIT` | 最大保有バー数超過による決済 |
+| `OUT_OF_SESSION` | 取引時間帯外 |
+| `SPREAD_TOO_HIGH` | スプレッド超過 |
+| `INSUFFICIENT_MARGIN` | 証拠金不足 |
+| `ORDER_SEND_FAIL` | 注文送信失敗 |
+| `MA_BUFFER_COPY_FAIL` | MAバッファ取得失敗 |
+| `EA_START` | EA起動（INIT イベント） |
+
+### session_state の読み方
+
+`session_state` 列には「判定結果:セッション枠(使用時刻ベース)」の形式で出力されます。
+
+```
+IN:08:00-11:00(JST)   → JST 8〜11時台（取引時間内）
+IN:16:00-18:00(JST)   → JST 16〜18時台（取引時間内）
+IN:21:00-24:00(JST)   → JST 21時以降（取引時間内）
+OUT(JST)              → 上記以外（取引時間外）
+IN:08:00-11:00(server) → サーバ時刻使用時（UseServerTimeForSessions=true）
+```
+
+### CSV サンプル出力
+
+```
+timestamp_server,timestamp_local,symbol,timeframe,event_type,side,reason,fast_ma_period,slow_ma_period,fast_ma_value,slow_ma_value,price_bid,price_ask,spread_points,lot,sl_price,tp_price,order_ticket,position_ticket,deal_ticket,retcode,last_error,session_state
+2024.01.15 01:05:00,2024.01.15 09:05:00,USDJPY,PERIOD_M5,INIT,NONE,EA_START,5,20,,,,,,,,,,,,,,IN:08:00-11:00(JST)
+2024.01.15 01:05:00,2024.01.15 09:05:00,USDJPY,PERIOD_M5,NEW_BAR,NONE,,5,20,,,,148.50000,148.50300,3,,,,,,,,,IN:08:00-11:00(JST)
+2024.01.15 01:05:00,2024.01.15 09:05:00,USDJPY,PERIOD_M5,SIGNAL,BUY,MA_CROSS_UP,5,20,148.51000,148.46000,148.50000,148.50300,3,,,,,,,,,IN:08:00-11:00(JST)
+2024.01.15 01:05:00,2024.01.15 09:05:00,USDJPY,PERIOD_M5,ENTRY,BUY,MA_CROSS_UP,5,20,148.51000,148.46000,148.50000,148.50300,3,0.01,148.40300,148.70300,12345678,,67890123,10009,,IN:08:00-11:00(JST)
+2024.01.15 02:00:00,2024.01.15 10:00:00,USDJPY,PERIOD_M5,EXIT,BUY,REVERSE_SIGNAL,5,20,,,,,,,,,,12345678,,87654321,10009,,IN:08:00-11:00(JST)
+2024.01.15 03:00:00,2024.01.15 11:00:00,USDJPY,PERIOD_M5,SKIP_TIME,NONE,OUT_OF_SESSION,5,20,,,,148.60000,148.60300,3,,,,,,,,,OUT(JST)
+```
+
+### ログを貼り付けて分析依頼する際の注意
+
+> ⚠️ **プライバシー・セキュリティに関するご注意**
+>
+> CSV ファイルには **口座番号・残高・個人情報は含まれません**（TicketID は含まれます）。  
+> ただし、チケット番号からポジション情報が特定される可能性があるため、共有前に以下をご確認ください。
+>
+> - `order_ticket` / `position_ticket` / `deal_ticket` 列が気になる場合は削除してから共有してください
+> - 本番口座のログを共有する場合は、チケット番号を別の番号に置換することをお勧めします
+> - CSVはデモ口座で動作確認した後に取得することを推奨します
+
+---
+
 ## ファイル構成
 
 ```
 fx_ea/
 ├── SimpleScalper.mq5   # EA本体
+├── Logger.mqh          # 分析ログモジュール（CSV/Print ログ）
 └── README.md           # このファイル
 ```
 
