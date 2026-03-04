@@ -19,16 +19,17 @@
    "timestamp_server,timestamp_local,symbol,timeframe,event_type,side,reason," \
    "fast_ma_period,slow_ma_period,fast_ma_value,slow_ma_value," \
    "price_bid,price_ask,spread_points,lot,sl_price,tp_price," \
-   "order_ticket,position_ticket,deal_ticket,retcode,last_error,session_state"
+   "order_ticket,position_ticket,deal_ticket,retcode,last_error,session_state," \
+   "deal_reason,profit,commission,swap,deal_price"
 
 //+------------------------------------------------------------------+
 //| ログエントリ構造体                                                |
 //+------------------------------------------------------------------+
 struct SLogEntry
 {
-   string event_type;       // INIT, DEINIT, NEW_BAR, SIGNAL, ENTRY, EXIT, SKIP_TIME, SKIP_SYMBOL, ERROR
+   string event_type;       // 例: INIT, DEINIT, NEW_BAR, SIGNAL, ENTRY, EXIT, DEAL_OUT, SKIP_TIME, SKIP_SYMBOL, ERROR など
    string side;             // BUY / SELL / NONE
-   string reason;           // MA_CROSS_UP, MA_CROSS_DOWN, REVERSE_SIGNAL, TIME_EXIT, OUT_OF_SESSION, SPREAD_TOO_HIGH など
+   string reason;           // MA_CROSS_UP, MA_CROSS_DOWN, REVERSE_SIGNAL, TIME_EXIT, TAKE_PROFIT, STOP_LOSS, EA_CLOSE など
    double fast_ma_value;    // 短期MA値（判定に使った値）
    double slow_ma_value;    // 長期MA値（判定に使った値）
    double price_bid;
@@ -43,6 +44,11 @@ struct SLogEntry
    uint   retcode;
    int    last_error;
    string session_state;    // 例: "IN:08:00-11:00(JST)" / "OUT(server)"
+   string deal_reason;      // DEAL_REASON_TP / DEAL_REASON_SL / DEAL_REASON_EXPERT など（EnumToString値）
+   double profit;           // 確定損益（DEAL_OUT時）
+   double commission;       // コミッション（DEAL_OUT時）
+   double swap;             // スワップ（DEAL_OUT時）
+   double deal_price;       // 約定価格（DEAL_OUT時）
 
    SLogEntry()
    {
@@ -63,6 +69,11 @@ struct SLogEntry
       deal_ticket     = 0;
       retcode     = 0;
       last_error  = 0;
+      deal_reason = "";
+      profit      = 0.0;
+      commission  = 0.0;
+      swap        = 0.0;
+      deal_price  = 0.0;
    }
 };
 
@@ -127,7 +138,12 @@ private:
       row += FormatUL(e.deal_ticket)                                          + ",";
       row += (e.retcode > 0    ? IntegerToString((long)e.retcode) : "")       + ",";
       row += (e.last_error != 0 ? IntegerToString(e.last_error)   : "")       + ",";
-      row += e.session_state;
+      row += e.session_state                                                   + ",";
+      row += e.deal_reason                                                     + ",";
+      row += FormatDbl(e.profit,     2)                                        + ",";
+      row += FormatDbl(e.commission, 2)                                        + ",";
+      row += FormatDbl(e.swap,       2)                                        + ",";
+      row += FormatDbl(e.deal_price);
       return row;
    }
 
@@ -165,6 +181,16 @@ private:
          msg += " error=" + IntegerToString(e.last_error);
       if (e.session_state != "")
          msg += " session=" + e.session_state;
+      if (e.deal_reason != "")
+         msg += " deal_reason=" + e.deal_reason;
+      if (e.deal_price > 0)
+         msg += " deal_price=" + FormatDbl(e.deal_price);
+      if (e.profit != 0.0)
+         msg += " profit=" + DoubleToString(e.profit, 2);
+      if (e.commission != 0.0)
+         msg += " commission=" + DoubleToString(e.commission, 2);
+      if (e.swap != 0.0)
+         msg += " swap=" + DoubleToString(e.swap, 2);
       return msg;
    }
 
