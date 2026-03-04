@@ -294,6 +294,27 @@ void CheckTimeExit()
 }
 
 //+------------------------------------------------------------------+
+//| Deal理由を可読文字列に変換する                                    |
+//+------------------------------------------------------------------+
+string DealReasonToString(ENUM_DEAL_REASON reason)
+{
+    switch (reason)
+    {
+        case DEAL_REASON_CLIENT:   return "MANUAL";
+        case DEAL_REASON_MOBILE:   return "MANUAL";
+        case DEAL_REASON_WEB:      return "MANUAL";
+        case DEAL_REASON_EXPERT:   return "EA_CLOSE";
+        case DEAL_REASON_SL:       return "STOP_LOSS";
+        case DEAL_REASON_TP:       return "TAKE_PROFIT";
+        case DEAL_REASON_SO:       return "STOP_OUT";
+        case DEAL_REASON_ROLLOVER: return "ROLLOVER";
+        case DEAL_REASON_VMARGIN:  return "VMARGIN";
+        case DEAL_REASON_SPLIT:    return "SPLIT";
+        default:                   return EnumToString(reason);
+    }
+}
+
+//+------------------------------------------------------------------+
 //| Expert initialization                                             |
 //+------------------------------------------------------------------+
 int OnInit()
@@ -670,5 +691,52 @@ void OnTick()
 
     if (VerboseLog && !buySignal && !sellSignal)
         Print("エントリー見送り | 理由: MAクロスシグナルなし");
+}
+
+//+------------------------------------------------------------------+
+//| Trade transaction handler（TP/SL含む全決済Dealをログ記録）       |
+//+------------------------------------------------------------------+
+void OnTradeTransaction(const MqlTradeTransaction& trans,
+                        const MqlTradeRequest&     request,
+                        const MqlTradeResult&      result)
+{
+    // DEAL_ADD トランザクションのみ処理
+    if (trans.type != TRADE_TRANSACTION_DEAL_ADD) return;
+
+    // 取引履歴からDeal情報を取得
+    if (!HistoryDealSelect(trans.deal)) return;
+
+    // このEAのマジックナンバーと通貨ペアに限定
+    if ((long)HistoryDealGetInteger(trans.deal, DEAL_MAGIC) != InpMagicNumber) return;
+    if (HistoryDealGetString(trans.deal, DEAL_SYMBOL) != InpSymbol) return;
+
+    // クローズ（OUT）または部分決済（INOUT）のみ対象
+    ENUM_DEAL_ENTRY dealEntry = (ENUM_DEAL_ENTRY)HistoryDealGetInteger(trans.deal, DEAL_ENTRY);
+    if (dealEntry != DEAL_ENTRY_OUT && dealEntry != DEAL_ENTRY_INOUT) return;
+
+    // Deal情報取得
+    ENUM_DEAL_TYPE   dealType   = (ENUM_DEAL_TYPE)HistoryDealGetInteger(trans.deal, DEAL_TYPE);
+    ENUM_DEAL_REASON dealReason = (ENUM_DEAL_REASON)HistoryDealGetInteger(trans.deal, DEAL_REASON);
+    double           dealProfit = HistoryDealGetDouble(trans.deal, DEAL_PROFIT);
+    double           dealComm   = HistoryDealGetDouble(trans.deal, DEAL_COMMISSION);
+    double           dealSwap   = HistoryDealGetDouble(trans.deal, DEAL_SWAP);
+    double           dealPrice  = HistoryDealGetDouble(trans.deal, DEAL_PRICE);
+    double           dealVol    = HistoryDealGetDouble(trans.deal, DEAL_VOLUME);
+    ulong            posId      = (ulong)HistoryDealGetInteger(trans.deal, DEAL_POSITION_ID);
+
+    SLogEntry e;
+    e.event_type      = "DEAL_OUT";
+    e.side            = (dealType == DEAL_TYPE_BUY) ? "BUY" : "SELL";
+    e.reason          = DealReasonToString(dealReason);
+    e.deal_reason     = EnumToString(dealReason);
+    e.profit          = dealProfit;
+    e.commission      = dealComm;
+    e.swap            = dealSwap;
+    e.deal_price      = dealPrice;
+    e.lot             = dealVol;
+    e.position_ticket = posId;
+    e.deal_ticket     = trans.deal;
+    e.session_state   = GetSessionState();
+    g_logger.LogEvent(LOG_LEVEL_TRADES, e);
 }
 //+------------------------------------------------------------------+

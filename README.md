@@ -127,6 +127,11 @@ SL損失額/Lot   = SL距離(ポイント) × (Point / TickSize) × TickValue
 2. **TP/SL**（ブローカー側で自動執行）  
 3. **時間切れ決済**（MaxBarsInTrade超過時、新バーごとにチェック）
 
+> **TP/SL決済はOnTradeTransactionで記録される**  
+> TP/SLによるサーバ側での自動決済は EA の `OnTick` では捕捉できないため、`OnTradeTransaction` ハンドラで取引履歴のDeal（`DEAL_ENTRY_OUT`）を監視してログに記録します。  
+> CSVでは `event_type=DEAL_OUT`、`reason` 列に `TAKE_PROFIT` / `STOP_LOSS` が記録されます（→ [reason一覧](#reason-一覧) を参照）。  
+> EA側の明示的な決済（逆シグナル・時間切れ）は `event_type=EXIT` として記録され、同じ決済について `DEAL_OUT` 行も別途追記されます。`deal_reason` 列でサーバ側の理由（`DEAL_REASON_EXPERT` など）を確認することで、どちらの仕組みで決済されたか区別できます。
+
 ---
 
 ## JST時間帯判定の仕組み
@@ -272,6 +277,11 @@ SimpleScalper 初期化完了 | Magic:20240001 | LotMode:RiskPercent | RiskPerce
 | `retcode` | 注文送信の戻りコード（10009=成功） |
 | `last_error` | エラー時の `GetLastError()` 値 |
 | `session_state` | セッション判定結果（例: `IN:08:00-11:00(JST)` / `OUT(server)`） |
+| `deal_reason` | サーバ側のDeal理由（EnumToString値: `DEAL_REASON_TP` / `DEAL_REASON_SL` / `DEAL_REASON_EXPERT` など）。`DEAL_OUT` 行のみ設定 |
+| `profit` | 確定損益（`DEAL_OUT` 行のみ） |
+| `commission` | コミッション（`DEAL_OUT` 行のみ） |
+| `swap` | スワップ（`DEAL_OUT` 行のみ） |
+| `deal_price` | 約定価格（`DEAL_OUT` 行のみ） |
 
 ### event_type 一覧
 
@@ -282,7 +292,8 @@ SimpleScalper 初期化完了 | Magic:20240001 | LotMode:RiskPercent | RiskPerce
 | `NEW_BAR` | 新規バー確定（`LogLevel=2` のみ出力） |
 | `SIGNAL` | MAクロスシグナル検出（`LogLevel=2` のみ出力） |
 | `ENTRY` | エントリー注文送信成功 |
-| `EXIT` | ポジション決済 |
+| `EXIT` | EA起点のポジション決済（逆シグナル・時間切れ） |
+| `DEAL_OUT` | 取引履歴に追加されたクローズDeal（TP/SL含む全決済）。`OnTradeTransaction` で記録 |
 | `SKIP_TIME` | 取引時間外のためスキップ |
 | `SKIP_SYMBOL` | スプレッド超過または証拠金不足のためスキップ |
 | `ERROR` | 注文失敗・MAデータ取得失敗などのエラー |
@@ -295,6 +306,12 @@ SimpleScalper 初期化完了 | Magic:20240001 | LotMode:RiskPercent | RiskPerce
 | `MA_CROSS_DOWN` | デッドクロス（売りシグナル） |
 | `REVERSE_SIGNAL` | 逆シグナルによるポジション決済 |
 | `TIME_EXIT` | 最大保有バー数超過による決済 |
+| `TAKE_PROFIT` | TP到達による自動決済（`DEAL_OUT` 行） |
+| `STOP_LOSS` | SL到達による自動決済（`DEAL_OUT` 行） |
+| `EA_CLOSE` | EA（EXPERT）が発行したクローズ（`DEAL_OUT` 行。逆シグナル・時間切れ等） |
+| `MANUAL` | 手動操作によるクローズ（CLIENT/MOBILE/WEB）（`DEAL_OUT` 行） |
+| `STOP_OUT` | 強制ロスカットによるクローズ（`DEAL_OUT` 行） |
+| `ROLLOVER` | ロールオーバーによるクローズ（`DEAL_OUT` 行） |
 | `OUT_OF_SESSION` | 取引時間帯外 |
 | `SPREAD_TOO_HIGH` | スプレッド超過 |
 | `INSUFFICIENT_MARGIN` | 証拠金不足 |
