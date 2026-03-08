@@ -20,16 +20,17 @@
    "fast_ma_period,slow_ma_period,fast_ma_value,slow_ma_value," \
    "price_bid,price_ask,spread_points,lot,sl_price,tp_price," \
    "order_ticket,position_ticket,deal_ticket,retcode,last_error,session_state," \
-   "deal_reason,profit,commission,swap,deal_price"
+   "deal_reason,profit,commission,swap,deal_price," \
+   "cooldown_until,htf_fast_ma_value,htf_slow_ma_value,htf_trend"
 
 //+------------------------------------------------------------------+
 //| ログエントリ構造体                                                |
 //+------------------------------------------------------------------+
 struct SLogEntry
 {
-   string event_type;       // 例: INIT, DEINIT, NEW_BAR, SIGNAL, ENTRY, EXIT, DEAL_OUT, SKIP_TIME, SKIP_SYMBOL, ERROR など
+   string event_type;       // 例: INIT, DEINIT, NEW_BAR, SIGNAL, ENTRY, EXIT, DEAL_OUT, SKIP_TIME, SKIP_SYMBOL, SKIP_COOLDOWN, ERROR など
    string side;             // BUY / SELL / NONE
-   string reason;           // MA_CROSS_UP, MA_CROSS_DOWN, REVERSE_SIGNAL, TIME_EXIT, TAKE_PROFIT, STOP_LOSS, EA_CLOSE など
+   string reason;           // MA_CROSS_UP, MA_CROSS_DOWN, REVERSE_SIGNAL, TIME_EXIT, TAKE_PROFIT, STOP_LOSS, EA_CLOSE, SPREAD_COOLDOWN, HTF_FILTER_BLOCKED など
    double fast_ma_value;    // 短期MA値（判定に使った値）
    double slow_ma_value;    // 長期MA値（判定に使った値）
    double price_bid;
@@ -49,6 +50,10 @@ struct SLogEntry
    double commission;       // コミッション（DEAL_OUT時）
    double swap;             // スワップ（DEAL_OUT時）
    double deal_price;       // 約定価格（DEAL_OUT時）
+   string cooldown_until;   // クールダウン終了時刻（SKIP_COOLDOWN時）
+   double htf_fast_ma_value; // 上位足短期MA値（HTFフィルタ時）
+   double htf_slow_ma_value; // 上位足長期MA値（HTFフィルタ時）
+   string htf_trend;        // 上位足トレンド方向（UP/DOWN/FLAT、HTFフィルタ時）
 
    SLogEntry()
    {
@@ -74,6 +79,10 @@ struct SLogEntry
       commission  = 0.0;
       swap        = 0.0;
       deal_price  = 0.0;
+      cooldown_until    = "";
+      htf_fast_ma_value = 0.0;
+      htf_slow_ma_value = 0.0;
+      htf_trend         = "";
    }
 };
 
@@ -143,7 +152,11 @@ private:
       row += FormatDbl(e.profit,     2)                                        + ",";
       row += FormatDbl(e.commission, 2)                                        + ",";
       row += FormatDbl(e.swap,       2)                                        + ",";
-      row += FormatDbl(e.deal_price);
+      row += FormatDbl(e.deal_price)                                           + ",";
+      row += e.cooldown_until                                                  + ",";
+      row += FormatDbl(e.htf_fast_ma_value)                                   + ",";
+      row += FormatDbl(e.htf_slow_ma_value)                                   + ",";
+      row += e.htf_trend;
       return row;
    }
 
@@ -191,6 +204,14 @@ private:
          msg += " commission=" + DoubleToString(e.commission, 2);
       if (e.swap != 0.0)
          msg += " swap=" + DoubleToString(e.swap, 2);
+      if (e.cooldown_until != "")
+         msg += " cooldown_until=" + e.cooldown_until;
+      if (e.htf_fast_ma_value != 0.0)
+         msg += " htf_fastMA=" + DoubleToString(e.htf_fast_ma_value, 5);
+      if (e.htf_slow_ma_value != 0.0)
+         msg += " htf_slowMA=" + DoubleToString(e.htf_slow_ma_value, 5);
+      if (e.htf_trend != "")
+         msg += " htf_trend=" + e.htf_trend;
       return msg;
    }
 
