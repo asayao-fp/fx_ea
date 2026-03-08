@@ -208,7 +208,7 @@ public:
 
    //--- 初期化（OnInit で呼ぶ）
    //    filePrefix : CSVファイル名のプレフィックス（例: "SimpleScalper"）
-   //    ファイル名  : <filePrefix>_YYYYMMDD.csv  → MQL5/Files/ に保存される
+   //    ファイル名  : <filePrefix>_YYYYMMDD.csv  → MQL5/Files/ に保存される（日付はJST=TimeLocal()基準）
    bool Init(bool        csvEnabled,
              bool        printEnabled,
              int         logLevel,
@@ -229,9 +229,9 @@ public:
 
       if (!m_csvEnabled) return true;
 
-      // ファイル名: prefix_YYYYMMDD.csv
+      // ファイル名: prefix_YYYYMMDD.csv（日付はJST=TimeLocal()基準）
       MqlDateTime dt;
-      TimeToStruct(TimeCurrent(), dt);
+      TimeToStruct(TimeLocal(), dt);
       string dateStr  = StringFormat("%04d%02d%02d", dt.year, dt.mon, dt.day);
       string fileName = filePrefix + "_" + dateStr + ".csv";
 
