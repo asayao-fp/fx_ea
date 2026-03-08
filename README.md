@@ -75,6 +75,24 @@ USDJPY専用・取引時間帯制限付き（JST対応）・MAクロスによる
 | `LogLevel` | `1` | ログ出力レベル（`0`=エラーのみ, `1`=取引イベント, `2`=全詳細） |
 | `UseServerTimeForSessions` | `false` | `true` のとき取引時間帯判定にサーバ時刻を使用（`false` のとき `UseJST` 設定を使用） |
 
+### スプレッドスパイク後クールダウン
+
+| パラメータ | デフォルト | 説明 |
+|-----------|-----------|------|
+| `EnableSpreadCooldown` | `true` | スプレッドスパイク後クールダウンを有効にする |
+| `SpreadSpikeThresholdPoints` | `60` | スパイクと判定するスプレッド閾値（ポイント）。この値**以上**でクールダウン開始 |
+| `SpreadCooldownMinutes` | `30` | スパイク検知後の新規エントリー抑制時間（分） |
+| `SpreadCooldownAppliesOutsideSession` | `true` | `true` のとき取引時間外でもスパイクを検知し、次のIN時間帯でクールダウンを適用する |
+
+### 上位足（H1）トレンドフィルタ
+
+| パラメータ | デフォルト | 説明 |
+|-----------|-----------|------|
+| `EnableHigherTimeframeFilter` | `false` | 上位足トレンドフィルタを有効にする |
+| `HigherTimeframe` | `PERIOD_H1` | 上位足の時間足（H1 推奨） |
+| `HigherFastMAPeriod` | `20` | 上位足の短期MA期間 |
+| `HigherSlowMAPeriod` | `50` | 上位足の長期MA期間 |
+
 > **注意**: USDJPYチャートの場合、1ポイント ≒ 0.001円相当（5桁ブローカーでは `100ポイント = 約1銭`）。
 
 ---
@@ -131,6 +149,50 @@ SL損失額/Lot   = SL距離(ポイント) × (Point / TickSize) × TickValue
 > TP/SLによるサーバ側での自動決済は EA の `OnTick` では捕捉できないため、`OnTradeTransaction` ハンドラで取引履歴のDeal（`DEAL_ENTRY_OUT`）を監視してログに記録します。  
 > CSVでは `event_type=DEAL_OUT`、`reason` 列に `TAKE_PROFIT` / `STOP_LOSS` が記録されます（→ [reason一覧](#reason-一覧) を参照）。  
 > EA側の明示的な決済（逆シグナル・時間切れ）は `event_type=EXIT` として記録され、同じ決済について `DEAL_OUT` 行も別途追記されます。`deal_reason` 列でサーバ側の理由（`DEAL_REASON_EXPERT` など）を確認することで、どちらの仕組みで決済されたか区別できます。
+
+---
+
+## スプレッドスパイク後クールダウン
+
+経済指標発表などでスプレッドが一時的に急拡大した直後の取引を避け、スキャルピングの期待値を改善するフィルタです。
+
+- **スパイク検知はすべてのティックで実行** される（新バー待ちなし）
+- `SpreadCooldownAppliesOutsideSession=true`（デフォルト）のとき、**取引時間帯外のスパイクも検知** し、次に取引時間帯に入っても即エントリーを抑制できる
+- スパイク検知時は `g_cooldownUntil = 現在時刻 + SpreadCooldownMinutes` を設定（延長可）
+- クールダウン中は **新規エントリーのみ** を抑制し、既存ポジションの決済・管理は継続
+- スキップ時のログ: `event_type=SKIP_COOLDOWN`, `reason=SPREAD_COOLDOWN`, `cooldown_until`（終了時刻）列に記録
+
+### クールダウンの流れ
+
+```
+[Out時間帯] Spread=80pts >= Threshold=60pts → g_cooldownUntil = 現在時刻 + 30分
+[In時間帯に移行] TimeCurrent() < g_cooldownUntil → SKIP_COOLDOWN ログ出力 → エントリーしない
+[30分経過後]  クールダウン終了 → 通常通りエントリー判定
+```
+
+---
+
+## 上位足（H1）トレンドフィルタ
+
+M15 の MAクロスシグナルを、上位足のトレンド方向に沿ったものだけ採用するフィルタです。
+
+- `EnableHigherTimeframeFilter=false`（デフォルト）では無効。有効にすると上位足方向と反対のエントリーをブロック
+- 判定ロジック:
+  - 上位足 fastMA **>** slowMA → **BUYのみ** 許可（SELLはブロック）
+  - 上位足 fastMA **<** slowMA → **SELLのみ** 許可（BUYはブロック）
+  - fastMA = slowMA（FLAT）の場合はBUY/SELL両方ブロック
+- ブロック時のログ: `event_type=SKIP_SYMBOL`, `reason=HTF_FILTER_BLOCKED`
+- `htf_fast_ma_value`, `htf_slow_ma_value`, `htf_trend`（UP/DOWN/FLAT）がCSVに記録される
+
+### A/Bテスト推奨設定
+
+HTFフィルタの効果を比較する場合、`MagicNumber` と `LogFileName` を分けて同じチャートに2つEAを稼働させてください。
+
+| 設定項目 | EA_A（フィルタなし） | EA_B（フィルタあり） |
+|---------|---------------------|---------------------|
+| `InpMagicNumber` | `20240001` | `20240002` |
+| `LogFileName` | `Scalper_A` | `Scalper_B` |
+| `EnableHigherTimeframeFilter` | `false` | `true` |
 
 ---
 
@@ -282,6 +344,10 @@ SimpleScalper 初期化完了 | Magic:20240001 | LotMode:RiskPercent | RiskPerce
 | `commission` | コミッション（`DEAL_OUT` 行のみ） |
 | `swap` | スワップ（`DEAL_OUT` 行のみ） |
 | `deal_price` | 約定価格（`DEAL_OUT` 行のみ） |
+| `cooldown_until` | クールダウン終了時刻（`SKIP_COOLDOWN` 行のみ） |
+| `htf_fast_ma_value` | 上位足短期MA値（HTFフィルタ有効時・`SKIP_SYMBOL/reason=HTF_FILTER_BLOCKED` 行） |
+| `htf_slow_ma_value` | 上位足長期MA値（HTFフィルタ有効時・`SKIP_SYMBOL/reason=HTF_FILTER_BLOCKED` 行） |
+| `htf_trend` | 上位足トレンド方向（`UP` / `DOWN` / `FLAT`）（HTFフィルタ有効時） |
 
 ### event_type 一覧
 
@@ -295,7 +361,8 @@ SimpleScalper 初期化完了 | Magic:20240001 | LotMode:RiskPercent | RiskPerce
 | `EXIT` | EA起点のポジション決済（逆シグナル・時間切れ） |
 | `DEAL_OUT` | 取引履歴に追加されたクローズDeal（TP/SL含む全決済）。`OnTradeTransaction` で記録 |
 | `SKIP_TIME` | 取引時間外のためスキップ |
-| `SKIP_SYMBOL` | スプレッド超過または証拠金不足のためスキップ |
+| `SKIP_SYMBOL` | スプレッド超過・証拠金不足・HTFフィルタブロックのためスキップ |
+| `SKIP_COOLDOWN` | スプレッドスパイク後クールダウン中のためスキップ |
 | `ERROR` | 注文失敗・MAデータ取得失敗などのエラー |
 
 ### reason 一覧
@@ -313,8 +380,10 @@ SimpleScalper 初期化完了 | Magic:20240001 | LotMode:RiskPercent | RiskPerce
 | `STOP_OUT` | 強制ロスカットによるクローズ（`DEAL_OUT` 行） |
 | `ROLLOVER` | ロールオーバーによるクローズ（`DEAL_OUT` 行） |
 | `OUT_OF_SESSION` | 取引時間帯外 |
-| `SPREAD_TOO_HIGH` | スプレッド超過 |
+| `SPREAD_TOO_HIGH` | スプレッド超過（`MaxSpreadPoints` 超え） |
+| `SPREAD_COOLDOWN` | スプレッドスパイク後クールダウン中（`SKIP_COOLDOWN` 行） |
 | `INSUFFICIENT_MARGIN` | 証拠金不足 |
+| `HTF_FILTER_BLOCKED` | 上位足トレンドフィルタにより方向不一致でブロック |
 | `ORDER_SEND_FAIL` | 注文送信失敗 |
 | `MA_BUFFER_COPY_FAIL` | MAバッファ取得失敗 |
 | `EA_START` | EA起動（INIT イベント） |
