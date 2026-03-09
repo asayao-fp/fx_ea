@@ -65,6 +65,35 @@ USDJPY専用・取引時間帯制限付き（JST対応）・MAクロスによる
 | `MaxSpreadPoints` | `30` | 新規エントリー時の最大許容スプレッド（ポイント） |
 | `VerboseLog` | `true` | 詳細ログをエキスパートタブに出力する |
 
+### スプレッドスパイク後クールダウン
+
+| パラメータ | デフォルト | 説明 |
+|-----------|-----------|------|
+| `EnableSpreadCooldown` | `true` | スプレッドスパイク後クールダウンを有効にする |
+| `SpreadSpikeThresholdPoints` | `60` | スパイク判定閾値（ポイント）。スプレッドがこの値**以上**になるとクールダウンをセットする |
+| `SpreadCooldownMinutes` | `30` | スパイク検知後の新規エントリー抑制時間（分）。複数スパイクが続く場合は最後のスパイクから延長される |
+
+スパイク検知は**取引時間外（OUT）でも常時実施**されます。OUT時間帯でスパイクが発生した場合でも、次にIN時間帯に入った直後のエントリーが抑制されます（新規エントリーのみ対象、既存ポジションの決済・管理は継続）。
+
+### 上位足（H1）トレンド方向フィルタ
+
+| パラメータ | デフォルト | 説明 |
+|-----------|-----------|------|
+| `EnableHigherTimeframeFilter` | `false` | 上位足トレンド方向フィルタを有効にする |
+| `HigherTimeframe` | `PERIOD_H1` | フィルタに使用する上位足タイムフレーム |
+| `HigherFastMAPeriod` | `20` | 上位足 短期MA期間 |
+| `HigherSlowMAPeriod` | `50` | 上位足 長期MA期間 |
+
+上位足MA（`HigherFastMAPeriod` / `HigherSlowMAPeriod`）のクロス状態でトレンド方向を判定し、M15のシグナルがトレンドと逆向きの場合はエントリーをスキップします。
+
+| 上位足判定 | 許可されるエントリー |
+|-----------|-------------------|
+| `fastMA > slowMA`（UP） | BUYのみ |
+| `fastMA < slowMA`（DOWN） | SELLのみ |
+| `fastMA == slowMA`（FLAT） | なし（両方スキップ） |
+
+> **注意**: `HigherFastMAPeriod` は `HigherSlowMAPeriod` より小さく設定してください。
+
 ### 分析ログ設定
 
 | パラメータ | デフォルト | 説明 |
@@ -282,6 +311,10 @@ SimpleScalper 初期化完了 | Magic:20240001 | LotMode:RiskPercent | RiskPerce
 | `commission` | コミッション（`DEAL_OUT` 行のみ） |
 | `swap` | スワップ（`DEAL_OUT` 行のみ） |
 | `deal_price` | 約定価格（`DEAL_OUT` 行のみ） |
+| `cooldown_until` | クールダウン終了時刻（`SKIP_COOLDOWN` 行のみ） |
+| `htf_fast_ma_value` | 上位足 短期MA値（HTFフィルタ有効時のスキップ行に出力） |
+| `htf_slow_ma_value` | 上位足 長期MA値（HTFフィルタ有効時のスキップ行に出力） |
+| `htf_trend` | 上位足トレンド方向（`UP` / `DOWN` / `FLAT`）（HTFフィルタ有効時のスキップ行に出力） |
 
 ### event_type 一覧
 
@@ -295,7 +328,8 @@ SimpleScalper 初期化完了 | Magic:20240001 | LotMode:RiskPercent | RiskPerce
 | `EXIT` | EA起点のポジション決済（逆シグナル・時間切れ） |
 | `DEAL_OUT` | 取引履歴に追加されたクローズDeal（TP/SL含む全決済）。`OnTradeTransaction` で記録 |
 | `SKIP_TIME` | 取引時間外のためスキップ |
-| `SKIP_SYMBOL` | スプレッド超過または証拠金不足のためスキップ |
+| `SKIP_SYMBOL` | スプレッド超過・証拠金不足・上位足フィルタ等のためスキップ |
+| `SKIP_COOLDOWN` | スプレッドスパイク後クールダウン中のためスキップ |
 | `ERROR` | 注文失敗・MAデータ取得失敗などのエラー |
 
 ### reason 一覧
@@ -314,6 +348,8 @@ SimpleScalper 初期化完了 | Magic:20240001 | LotMode:RiskPercent | RiskPerce
 | `ROLLOVER` | ロールオーバーによるクローズ（`DEAL_OUT` 行） |
 | `OUT_OF_SESSION` | 取引時間帯外 |
 | `SPREAD_TOO_HIGH` | スプレッド超過 |
+| `SPREAD_COOLDOWN` | スプレッドスパイク後クールダウン中（`SKIP_COOLDOWN` 行） |
+| `HTF_FILTER_BLOCKED` | 上位足トレンドと反対方向のため抑制（`SKIP_SYMBOL` 行） |
 | `INSUFFICIENT_MARGIN` | 証拠金不足 |
 | `ORDER_SEND_FAIL` | 注文送信失敗 |
 | `MA_BUFFER_COPY_FAIL` | MAバッファ取得失敗 |
@@ -353,6 +389,27 @@ timestamp_server,timestamp_local,symbol,timeframe,event_type,side,reason,fast_ma
 > - `order_ticket` / `position_ticket` / `deal_ticket` 列が気になる場合は削除してから共有してください
 > - 本番口座のログを共有する場合は、チケット番号を別の番号に置換することをお勧めします
 > - CSVはデモ口座で動作確認した後に取得することを推奨します
+
+---
+
+## 新機能の A/B テスト推奨手順
+
+スプレッドクールダウンや上位足フィルタの効果を定量評価するため、**2つのEAインスタンスを同時に稼働**させてログを比較することを推奨します。
+
+### 設定例（同一チャートに2インスタンスをアタッチ）
+
+| 設定項目 | インスタンス A（ベースライン） | インスタンス B（フィルタあり） |
+|---------|--------------------------|--------------------------|
+| `InpMagicNumber` | `20240001` | `20240002` |
+| `LogFileName` | `SimpleScalper_A` | `SimpleScalper_B` |
+| `EnableSpreadCooldown` | `false` | `true` |
+| `EnableHigherTimeframeFilter` | `false` | `true` |
+
+### 分析のポイント
+
+- `MagicNumber` を分けることでポジション管理が干渉しません
+- `LogFileName` を分けることでCSVが別ファイルに保存され比較が容易です
+- インスタンスBで `event_type=SKIP_COOLDOWN` や `reason=HTF_FILTER_BLOCKED` の行が記録されたエントリーが、インスタンスAでどのような結果だったか確認することで、フィルタの効果を測定できます
 
 ---
 

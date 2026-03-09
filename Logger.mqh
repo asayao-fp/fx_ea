@@ -20,7 +20,8 @@
    "fast_ma_period,slow_ma_period,fast_ma_value,slow_ma_value," \
    "price_bid,price_ask,spread_points,lot,sl_price,tp_price," \
    "order_ticket,position_ticket,deal_ticket,retcode,last_error,session_state," \
-   "deal_reason,profit,commission,swap,deal_price"
+   "deal_reason,profit,commission,swap,deal_price," \
+   "cooldown_until,htf_fast_ma_value,htf_slow_ma_value,htf_trend"
 
 //+------------------------------------------------------------------+
 //| ログエントリ構造体                                                |
@@ -50,6 +51,14 @@ struct SLogEntry
    double swap;             // スワップ（DEAL_OUT時）
    double deal_price;       // 約定価格（DEAL_OUT時）
 
+   // スプレッドクールダウン
+   datetime cooldown_until;    // クールダウン終了時刻（SKIP_COOLDOWN 時に設定）
+
+   // 上位足トレンドフィルタ
+   double htf_fast_ma_value;   // 上位足 短期MA値
+   double htf_slow_ma_value;   // 上位足 長期MA値
+   string htf_trend;           // 上位足トレンド方向 "UP" / "DOWN" / "FLAT"
+
    SLogEntry()
    {
       event_type    = "";
@@ -74,6 +83,10 @@ struct SLogEntry
       commission  = 0.0;
       swap        = 0.0;
       deal_price  = 0.0;
+      cooldown_until    = 0;
+      htf_fast_ma_value = 0.0;
+      htf_slow_ma_value = 0.0;
+      htf_trend         = "";
    }
 };
 
@@ -144,6 +157,11 @@ private:
       row += FormatDbl(e.commission, 2)                                        + ",";
       row += FormatDbl(e.swap,       2)                                        + ",";
       row += FormatDbl(e.deal_price);
+      row += ",";
+      row += (e.cooldown_until > 0 ? FormatDT(e.cooldown_until) : "")         + ",";
+      row += FormatDbl(e.htf_fast_ma_value)                                    + ",";
+      row += FormatDbl(e.htf_slow_ma_value)                                    + ",";
+      row += e.htf_trend;
       return row;
    }
 
@@ -191,6 +209,14 @@ private:
          msg += " commission=" + DoubleToString(e.commission, 2);
       if (e.swap != 0.0)
          msg += " swap=" + DoubleToString(e.swap, 2);
+      if (e.cooldown_until > 0)
+         msg += " cooldown_until=" + TimeToString(e.cooldown_until, TIME_DATE|TIME_SECONDS);
+      if (e.htf_trend != "")
+      {
+         msg += " htfFastMA=" + DoubleToString(e.htf_fast_ma_value, 5);
+         msg += " htfSlowMA=" + DoubleToString(e.htf_slow_ma_value, 5);
+         msg += " htfTrend=" + e.htf_trend;
+      }
       return msg;
    }
 

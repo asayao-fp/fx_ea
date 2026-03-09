@@ -48,6 +48,17 @@ input int      JSTUtcOffsetHours    = 9;      // JSTのUTCオフセット（時�
 //--- スプレッドフィルタ
 input int      MaxSpreadPoints = 30;          // 最大許容スプレッド（ポイント）
 
+//--- スプレッドスパイク後クールダウン
+input bool     EnableSpreadCooldown           = true; // スプレッドスパイク後クールダウンを有効にする
+input int      SpreadSpikeThresholdPoints     = 60;   // スプレッドスパイク判定閾値（ポイント）
+input int      SpreadCooldownMinutes          = 30;   // スパイク後の新規エントリー抑制時間（分）
+
+//--- 上位足（H1）トレンド方向フィルタ
+input bool            EnableHigherTimeframeFilter = false;      // 上位足トレンドフィルタを有効にする
+input ENUM_TIMEFRAMES HigherTimeframe             = PERIOD_H1;  // 上位足タイムフレーム
+input int             HigherFastMAPeriod          = 20;         // 上位足 短期MA期間
+input int             HigherSlowMAPeriod          = 50;         // 上位足 長期MA期間
+
 //--- ログ
 input bool     VerboseLog = true;             // 詳細ログを出力する（既存の詳細ログ）
 
@@ -63,6 +74,13 @@ CTrade  Trade;
 int     g_shortMaHandle = INVALID_HANDLE;
 int     g_longMaHandle  = INVALID_HANDLE;
 CLogger g_logger;
+
+// スプレッドクールダウン
+datetime g_cooldownUntil   = 0;
+
+// 上位足MAハンドル
+int      g_htfFastMaHandle = INVALID_HANDLE;
+int      g_htfSlowMaHandle = INVALID_HANDLE;
 
 //+------------------------------------------------------------------+
 //| サーバ時刻をJST時刻に変換してdatetimeを返す                      |
@@ -358,6 +376,24 @@ int OnInit()
         return INIT_FAILED;
     }
 
+    // 上位足MAインジケータ初期化
+    if (EnableHigherTimeframeFilter)
+    {
+        if (HigherFastMAPeriod >= HigherSlowMAPeriod)
+        {
+            Alert("上位足フィルタ: HigherFastMAPeriodはHigherSlowMAPeriodより小さくしてください。"
+                  " FastMA=", HigherFastMAPeriod, " SlowMA=", HigherSlowMAPeriod);
+            return INIT_FAILED;
+        }
+        g_htfFastMaHandle = iMA(InpSymbol, HigherTimeframe, HigherFastMAPeriod, 0, InpMaMethod, PRICE_CLOSE);
+        g_htfSlowMaHandle = iMA(InpSymbol, HigherTimeframe, HigherSlowMAPeriod, 0, InpMaMethod, PRICE_CLOSE);
+        if (g_htfFastMaHandle == INVALID_HANDLE || g_htfSlowMaHandle == INVALID_HANDLE)
+        {
+            Alert("上位足MAインジケータの初期化に失敗しました。");
+            return INIT_FAILED;
+        }
+    }
+
     Trade.SetExpertMagicNumber(InpMagicNumber);
     Trade.SetDeviationInPoints(10);
 
@@ -377,7 +413,9 @@ int OnInit()
           " | LotMode:", (InpLotMode == LOT_FIXED ? "Fixed" : "RiskPercent"),
           " | ", lotInfo,
           " | TP:", InpTakeProfit, " | SL:", InpStopLoss,
-          " | MaxBarsInTrade:", InpMaxBarsInTrade);
+          " | MaxBarsInTrade:", InpMaxBarsInTrade,
+          " | SpreadCooldown:", (EnableSpreadCooldown ? "ON" : "OFF"),
+          " | HTFFilter:", (EnableHigherTimeframeFilter ? "ON" : "OFF"));
     Print("時刻情報 | Server:", TimeToString(serverNow, TIME_DATE|TIME_MINUTES),
           " | UTC:", TimeToString(utcNow, TIME_DATE|TIME_MINUTES),
           " | JST:", TimeToString(jstNow, TIME_DATE|TIME_MINUTES),
@@ -409,6 +447,8 @@ void OnDeinit(const int reason)
 
     if (g_shortMaHandle != INVALID_HANDLE) IndicatorRelease(g_shortMaHandle);
     if (g_longMaHandle  != INVALID_HANDLE) IndicatorRelease(g_longMaHandle);
+    if (g_htfFastMaHandle != INVALID_HANDLE) IndicatorRelease(g_htfFastMaHandle);
+    if (g_htfSlowMaHandle != INVALID_HANDLE) IndicatorRelease(g_htfSlowMaHandle);
     g_logger.Deinit();
 }
 
@@ -435,6 +475,17 @@ void OnTick()
     // 取引時間帯チェック（GetSessionState()も含めて1回だけ評価）
     bool   inTradeTime  = IsTradeTime();
     string sessionState = GetSessionState();
+
+    // スプレッドスパイク検知（取引時間外でも実施）
+    if (EnableSpreadCooldown && spread >= SpreadSpikeThresholdPoints)
+    {
+        datetime newCooldown = TimeCurrent() + SpreadCooldownMinutes * 60;
+        if (newCooldown > g_cooldownUntil)
+            g_cooldownUntil = newCooldown;
+        if (VerboseLog)
+            Print("スプレッドスパイク検知 | Spread:", spread, "pts >= 閾値:", SpreadSpikeThresholdPoints,
+                  "pts | クールダウン終了:", TimeToString(g_cooldownUntil, TIME_DATE|TIME_MINUTES));
+    }
 
     // VerboseLog: 基本情報出力
     if (VerboseLog)
@@ -471,6 +522,26 @@ void OnTick()
         e.price_bid     = bid;
         e.price_ask     = ask;
         e.spread_points = spread;
+        e.session_state = sessionState;
+        g_logger.LogEvent(LOG_LEVEL_TRADES, e);
+        return;
+    }
+
+    // スプレッドクールダウンチェック
+    if (EnableSpreadCooldown && TimeCurrent() < g_cooldownUntil)
+    {
+        int remainMinutes = (int)((g_cooldownUntil - TimeCurrent() + 59) / 60); // 切り上げ
+        if (VerboseLog)
+            Print("エントリー見送り | 理由: スプレッドクールダウン中 | 残り約:", remainMinutes,
+                  "分 | クールダウン終了:", TimeToString(g_cooldownUntil, TIME_DATE|TIME_MINUTES));
+
+        SLogEntry e;
+        e.event_type    = "SKIP_COOLDOWN";
+        e.reason        = "SPREAD_COOLDOWN";
+        e.price_bid     = bid;
+        e.price_ask     = ask;
+        e.spread_points = spread;
+        e.cooldown_until = g_cooldownUntil;
         e.session_state = sessionState;
         g_logger.LogEvent(LOG_LEVEL_TRADES, e);
         return;
@@ -553,6 +624,87 @@ void OnTick()
         e.spread_points = spread;
         e.session_state = sessionState;
         g_logger.LogEvent(LOG_LEVEL_VERBOSE, e);
+    }
+
+    // 上位足トレンドフィルタ
+    double htfFastMaVal = 0.0, htfSlowMaVal = 0.0;
+    string htfTrend = "";
+    if (EnableHigherTimeframeFilter && (buySignal || sellSignal))
+    {
+        double htfFastBuf[1], htfSlowBuf[1];
+        bool htfOk = (CopyBuffer(g_htfFastMaHandle, 0, 1, 1, htfFastBuf) >= 1) &&
+                     (CopyBuffer(g_htfSlowMaHandle,  0, 1, 1, htfSlowBuf) >= 1);
+        if (!htfOk)
+        {
+            Print("上位足MAデータの取得に失敗しました。");
+            SLogEntry e;
+            e.event_type    = "ERROR";
+            e.reason        = "MA_BUFFER_COPY_FAIL";
+            e.last_error    = GetLastError();
+            e.session_state = sessionState;
+            g_logger.LogEvent(LOG_LEVEL_ERRORS, e);
+            buySignal  = false;
+            sellSignal = false;
+        }
+        else
+        {
+            htfFastMaVal = htfFastBuf[0];
+            htfSlowMaVal = htfSlowBuf[0];
+            htfTrend = (htfFastMaVal > htfSlowMaVal) ? "UP"
+                     : (htfFastMaVal < htfSlowMaVal) ? "DOWN" : "FLAT";
+
+            if (VerboseLog)
+                Print("HTFフィルタ | TF:", EnumToString(HigherTimeframe),
+                      " | FastMA:", DoubleToString(htfFastMaVal, 5),
+                      " | SlowMA:", DoubleToString(htfSlowMaVal, 5),
+                      " | Trend:", htfTrend);
+
+            // BUYシグナルが上位足DOWN（fastMA < slowMA）またはFLAT（fastMA == slowMA）と不一致 → ブロック
+            if (buySignal && htfFastMaVal <= htfSlowMaVal)
+            {
+                if (VerboseLog)
+                    Print("エントリー見送り | 理由: 上位足トレンド不一致 | シグナル:BUY | HTF:", htfTrend);
+
+                SLogEntry e;
+                e.event_type        = "SKIP_SYMBOL";
+                e.side              = "BUY";
+                e.reason            = "HTF_FILTER_BLOCKED";
+                e.fast_ma_value     = shortMaCurr;
+                e.slow_ma_value     = longMaCurr;
+                e.htf_fast_ma_value = htfFastMaVal;
+                e.htf_slow_ma_value = htfSlowMaVal;
+                e.htf_trend         = htfTrend;
+                e.price_bid         = bid;
+                e.price_ask         = ask;
+                e.spread_points     = spread;
+                e.session_state     = sessionState;
+                g_logger.LogEvent(LOG_LEVEL_TRADES, e);
+                buySignal = false;
+            }
+
+            // SELLシグナルが上位足UP（fastMA > slowMA）またはFLAT（fastMA == slowMA）と不一致 → ブロック
+            if (sellSignal && htfFastMaVal >= htfSlowMaVal)
+            {
+                if (VerboseLog)
+                    Print("エントリー見送り | 理由: 上位足トレンド不一致 | シグナル:SELL | HTF:", htfTrend);
+
+                SLogEntry e;
+                e.event_type        = "SKIP_SYMBOL";
+                e.side              = "SELL";
+                e.reason            = "HTF_FILTER_BLOCKED";
+                e.fast_ma_value     = shortMaCurr;
+                e.slow_ma_value     = longMaCurr;
+                e.htf_fast_ma_value = htfFastMaVal;
+                e.htf_slow_ma_value = htfSlowMaVal;
+                e.htf_trend         = htfTrend;
+                e.price_bid         = bid;
+                e.price_ask         = ask;
+                e.spread_points     = spread;
+                e.session_state     = sessionState;
+                g_logger.LogEvent(LOG_LEVEL_TRADES, e);
+                sellSignal = false;
+            }
+        }
     }
 
     // 買いシグナル: 売りポジションを逆シグナル決済 → 買いエントリー
