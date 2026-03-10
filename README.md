@@ -1,7 +1,33 @@
-# SimpleScalper — USDJPY限定 MAクロス スキャルピングEA
+# SimpleScalper — USDJPY限定 マルチ戦略スキャルピングEA
 
-MT5（MetaTrader 5）用の最小構成スキャルピングEAです。  
-USDJPY専用・取引時間帯制限付き（JST対応）・MAクロスによるエントリーロジック・スプレッドフィルタを実装しています。
+MT5（MetaTrader 5）用のスキャルピングEAです。  
+USDJPY専用・取引時間帯制限付き（JST対応）・**複数戦略の並行評価（OR型）**によるエントリーロジック・スプレッドフィルタを実装しています。
+
+---
+
+## アーキテクチャ概要
+
+```
+共通ゲート（精度担保）
+  ├── 取引時間帯（JST）
+  ├── スプレッドスパイク後クールダウン
+  ├── スプレッド上限（MaxSpreadPoints）
+  └── 上位足トレンドフィルタ（有効時）
+          ↓ 通過した場合のみ
+戦略評価（並行・OR型）
+  ├── 戦略A: MAクロス → BUY / SELL / NONE
+  └── 戦略B: ブレイクアウト → BUY / SELL / NONE
+          ↓
+集約ロジック
+  ├── BUYのみ → BUY エントリー
+  ├── SELLのみ → SELL エントリー
+  ├── BUY + SELL → 見送り（SIGNAL_CONFLICT）
+  └── どちらもなし → 見送り
+          ↓ エントリー可の場合
+取引回数制限（安全弁）
+  ├── DailyMaxTrades（日次上限）
+  └── MinMinutesBetweenEntries（間隔制限）
+```
 
 ---
 
@@ -11,7 +37,7 @@ USDJPY専用・取引時間帯制限付き（JST対応）・MAクロスによる
 |------|------|
 | 通貨ペア | USDJPY 固定 |
 | 取引時間帯 | 8:00〜11:00 / 16:00〜18:00 / 21:00〜24:00（JST基準、`UseJST=true`の場合） |
-| エントリー | 短期MAが長期MAを**上抜け** → 買い<br>短期MAが長期MAを**下抜け** → 売り |
+| エントリー戦略 | **MAクロス**（短期MAが長期MAを上抜け→買い、下抜け→売り）または **ブレイクアウト**（直近N本高値/安値を更新→BUY/SELL）。どちらかがシグナルを出せばエントリー（OR型）。両方から逆方向シグナルが出た場合は見送り（安全優先）。 |
 | 決済 | 固定TP/SL、逆シグナル発生時の即決済、または時間切れ（MaxBarsInTrade） |
 | バー確認 | 新規バー開始時のみシグナルを評価（バー確定後エントリー） |
 | スプレッドフィルタ | スプレッドが `MaxSpreadPoints` を超える場合はエントリーしない |
@@ -93,6 +119,32 @@ USDJPY専用・取引時間帯制限付き（JST対応）・MAクロスによる
 | `fastMA == slowMA`（FLAT） | なし（両方スキップ） |
 
 > **注意**: `HigherFastMAPeriod` は `HigherSlowMAPeriod` より小さく設定してください。
+
+### ブレイクアウト戦略
+
+| パラメータ | デフォルト | 説明 |
+|-----------|-----------|------|
+| `EnableBreakoutStrategy` | `true` | ブレイクアウト戦略を有効にする |
+| `BreakoutLookbackBars` | `20` | ブレイクアウト判定の参照バー数（確定足のみ。現在形成中の足は含まない） |
+| `BreakoutBufferPoints` | `2` | ブレイクアウト判定のバッファ（ポイント） |
+
+稼働足（`PERIOD_CURRENT`）の直近 `BreakoutLookbackBars` 本の**確定足**の高値/安値を基準にブレイクアウトを判定します。
+
+| 条件 | シグナル |
+|------|--------|
+| `Ask >= 直近N本高値 + バッファ` | BUY |
+| `Bid <= 直近N本安値 - バッファ` | SELL |
+
+> 形成中のバー（bar 0）は除外されます。稼働足タイムフレームに自動追従します（`PERIOD_CURRENT` 使用）。
+
+### 取引回数制限（安全弁）
+
+| パラメータ | デフォルト | 説明 |
+|-----------|-----------|------|
+| `DailyMaxTrades` | `10` | 1日の最大新規エントリー回数（`0` で無制限。JSTベース日付で管理） |
+| `MinMinutesBetweenEntries` | `5` | エントリー間の最小間隔（分）。`0` で無制限。 |
+
+日次カウントはJST日付の変わり目でリセットされます。既存ポジションの決済はカウントに含まれません。
 
 ### 分析ログ設定
 
@@ -336,8 +388,14 @@ SimpleScalper 初期化完了 | Magic:20240001 | LotMode:RiskPercent | RiskPerce
 
 | reason | 説明 |
 |--------|------|
-| `MA_CROSS_UP` | ゴールデンクロス（買いシグナル） |
-| `MA_CROSS_DOWN` | デッドクロス（売りシグナル） |
+| `MA_CROSS_UP` | ゴールデンクロス（MAクロス戦略 買いシグナル） |
+| `MA_CROSS_DOWN` | デッドクロス（MAクロス戦略 売りシグナル） |
+| `BREAKOUT_UP` | 上方ブレイクアウト（ブレイクアウト戦略 買いシグナル） |
+| `BREAKOUT_DOWN` | 下方ブレイクアウト（ブレイクアウト戦略 売りシグナル） |
+| `MA_CROSS_UP+BREAKOUT_UP` | 複数戦略が同じ方向に一致した場合の複合reason（例） |
+| `SIGNAL_CONFLICT` | 同一バーでBUYとSELLが同時に出たため見送り（`SKIP_SYMBOL` 行） |
+| `DAILY_TRADE_LIMIT` | 日次取引上限に達したため見送り（`SKIP_SYMBOL` 行） |
+| `ENTRY_TOO_SOON` | 前回エントリーから最小間隔未達のため見送り（`SKIP_SYMBOL` 行） |
 | `REVERSE_SIGNAL` | 逆シグナルによるポジション決済 |
 | `TIME_EXIT` | 最大保有バー数超過による決済 |
 | `TAKE_PROFIT` | TP到達による自動決済（`DEAL_OUT` 行） |
@@ -394,21 +452,34 @@ timestamp_server,timestamp_local,symbol,timeframe,event_type,side,reason,fast_ma
 
 ## 新機能の A/B テスト推奨手順
 
-スプレッドクールダウンや上位足フィルタの効果を定量評価するため、**2つのEAインスタンスを同時に稼働**させてログを比較することを推奨します。
+スプレッドクールダウン・上位足フィルタ・ブレイクアウト戦略の効果を定量評価するため、**2つのEAインスタンスを同時に稼働**させてログを比較することを推奨します。
 
-### 設定例（同一チャートに2インスタンスをアタッチ）
+### 設定例：ブレイクアウト戦略の有無比較
 
-| 設定項目 | インスタンス A（ベースライン） | インスタンス B（フィルタあり） |
-|---------|--------------------------|--------------------------|
+| 設定項目 | インスタンス A（MAクロスのみ） | インスタンス B（MAクロス + ブレイクアウト） |
+|---------|--------------------------|----------------------------------------|
+| `InpMagicNumber` | `20240001` | `20240002` |
+| `LogFileName` | `SimpleScalper_A` | `SimpleScalper_B` |
+| `EnableBreakoutStrategy` | `false` | `true` |
+| `EnableHigherTimeframeFilter` | `false` | `false` |
+
+### 設定例：全フィルタ有効化の比較
+
+| 設定項目 | インスタンス A（ベースライン） | インスタンス B（全フィルタあり） |
+|---------|--------------------------|-------------------------------|
 | `InpMagicNumber` | `20240001` | `20240002` |
 | `LogFileName` | `SimpleScalper_A` | `SimpleScalper_B` |
 | `EnableSpreadCooldown` | `false` | `true` |
 | `EnableHigherTimeframeFilter` | `false` | `true` |
+| `EnableBreakoutStrategy` | `false` | `true` |
 
 ### 分析のポイント
 
 - `MagicNumber` を分けることでポジション管理が干渉しません
 - `LogFileName` を分けることでCSVが別ファイルに保存され比較が容易です
+- `reason` 列で `MA_CROSS_UP` / `BREAKOUT_UP` などの戦略を確認できます
+- `reason=SIGNAL_CONFLICT` の行はBUY/SELLが同時に出たバー（見送り）を示します
+- `reason=DAILY_TRADE_LIMIT` / `ENTRY_TOO_SOON` で取引回数制限の効果が確認できます
 - インスタンスBで `event_type=SKIP_COOLDOWN` や `reason=HTF_FILTER_BLOCKED` の行が記録されたエントリーが、インスタンスAでどのような結果だったか確認することで、フィルタの効果を測定できます
 
 ---
@@ -418,6 +489,7 @@ timestamp_server,timestamp_local,symbol,timeframe,event_type,side,reason,fast_ma
 ```
 fx_ea/
 ├── SimpleScalper.mq5   # EA本体
+├── Strategies.mqh      # 戦略評価モジュール（MAクロス・ブレイクアウト）
 ├── Logger.mqh          # 分析ログモジュール（CSV/Print ログ）
 └── README.md           # このファイル
 ```

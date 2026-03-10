@@ -3,12 +3,13 @@
 //|                        USDJPY専用 MAクロス スキャルピングEA       |
 //+------------------------------------------------------------------+
 #property copyright "SimpleScalper"
-#property version   "1.02"
+#property version   "1.03"
 #property strict
 
 #include <Trade\Trade.mqh>
 #include <Trade\PositionInfo.mqh>
 #include "Logger.mqh"
+#include "Strategies.mqh"
 
 //--- ロットモード列挙型
 enum ENUM_LOT_MODE
@@ -59,6 +60,15 @@ input ENUM_TIMEFRAMES HigherTimeframe             = PERIOD_H1;  // 上位足タ�
 input int             HigherFastMAPeriod          = 20;         // 上位足 短期MA期間
 input int             HigherSlowMAPeriod          = 50;         // 上位足 長期MA期間
 
+//--- ブレイクアウト戦略
+input bool  EnableBreakoutStrategy   = true; // ブレイクアウト戦略を有効にする
+input int   BreakoutLookbackBars     = 20;   // ブレイクアウト判定の参照バー数（確定足）
+input int   BreakoutBufferPoints     = 2;    // ブレイクアウトバッファ（ポイント）
+
+//--- 取引回数制限（安全弁）
+input int   DailyMaxTrades           = 10;  // 1日の最大取引回数（0=無制限, JSTベース）
+input int   MinMinutesBetweenEntries = 5;   // エントリー間隔の最小時間（分, 0=無制限）
+
 //--- ログ
 input bool     VerboseLog = true;             // 詳細ログを出力する（既存の詳細ログ）
 
@@ -82,6 +92,11 @@ datetime g_cooldownUntil   = 0;
 int      g_htfFastMaHandle = INVALID_HANDLE;
 int      g_htfSlowMaHandle = INVALID_HANDLE;
 
+// 取引回数管理（JSTベース日次カウント）
+int      g_dailyTradeCount = 0;          // 本日の取引回数
+datetime g_lastEntryTime   = 0;          // 最後のエントリー時刻
+string   g_lastTradeDate   = "";         // 最後にカウントリセットした日付（JST）
+
 //+------------------------------------------------------------------+
 //| サーバ時刻をJST時刻に変換してdatetimeを返す                      |
 //+------------------------------------------------------------------+
@@ -100,6 +115,17 @@ int GetCurrentJSTHour()
     MqlDateTime dt;
     TimeToStruct(ServerTimeToJST(TimeCurrent()), dt);
     return dt.hour;
+}
+
+//+------------------------------------------------------------------+
+//| 現在のJST日付を "YYYY-MM-DD" 形式の文字列で返す                  |
+//| 取引回数の日次リセット判定に使用する                              |
+//+------------------------------------------------------------------+
+string GetJSTDateString()
+{
+    MqlDateTime dt;
+    TimeToStruct(ServerTimeToJST(TimeCurrent()), dt);
+    return StringFormat("%04d-%02d-%02d", dt.year, dt.mon, dt.day);
 }
 
 //+------------------------------------------------------------------+
@@ -415,7 +441,10 @@ int OnInit()
           " | TP:", InpTakeProfit, " | SL:", InpStopLoss,
           " | MaxBarsInTrade:", InpMaxBarsInTrade,
           " | SpreadCooldown:", (EnableSpreadCooldown ? "ON" : "OFF"),
-          " | HTFFilter:", (EnableHigherTimeframeFilter ? "ON" : "OFF"));
+          " | HTFFilter:", (EnableHigherTimeframeFilter ? "ON" : "OFF"),
+          " | Breakout:", (EnableBreakoutStrategy ? "ON" : "OFF"),
+          " | DailyMaxTrades:", DailyMaxTrades,
+          " | MinMinutesBetweenEntries:", MinMinutesBetweenEntries);
     Print("時刻情報 | Server:", TimeToString(serverNow, TIME_DATE|TIME_MINUTES),
           " | UTC:", TimeToString(utcNow, TIME_DATE|TIME_MINUTES),
           " | JST:", TimeToString(jstNow, TIME_DATE|TIME_MINUTES),
@@ -462,6 +491,17 @@ void OnTick()
     datetime currentBarTime = iTime(InpSymbol, PERIOD_CURRENT, 0);
     if (currentBarTime == lastBarTime) return;
     lastBarTime = currentBarTime;
+
+    // 日次トレードカウントのリセット（JST日付変更時）
+    string todayJST = GetJSTDateString();
+    if (todayJST != g_lastTradeDate)
+    {
+        if (g_lastTradeDate != "")
+            Print("日次トレードカウントリセット | 前日:", g_lastTradeDate,
+                  " 取引回数:", g_dailyTradeCount, "回");
+        g_dailyTradeCount = 0;
+        g_lastTradeDate   = todayJST;
+    }
 
     // 時間切れ決済チェック
     CheckTimeExit();
@@ -563,62 +603,46 @@ void OnTick()
         return;
     }
 
-    // MAバッファ取得（直近2本分）
-    double shortMa[2], longMa[2];
-    if (CopyBuffer(g_shortMaHandle, 0, 1, 2, shortMa) < 2)
+    // --- 戦略評価 ---
+
+    // MAクロス戦略評価
+    SStrategySignal maSig = EvaluateMACross(g_shortMaHandle, g_longMaHandle);
+    if (maSig.error)
     {
-        Print("短期MAデータの取得に失敗しました。");
+        Print("短期/長期MAデータの取得に失敗しました。");
         SLogEntry e;
-        e.event_type  = "ERROR";
-        e.reason      = "MA_BUFFER_COPY_FAIL";
-        e.last_error  = GetLastError();
+        e.event_type    = "ERROR";
+        e.reason        = maSig.reason;
+        e.last_error    = GetLastError();
         e.session_state = sessionState;
         g_logger.LogEvent(LOG_LEVEL_ERRORS, e);
         return;
     }
-    if (CopyBuffer(g_longMaHandle,  0, 1, 2, longMa)  < 2)
-    {
-        Print("長期MAデータの取得に失敗しました。");
-        SLogEntry e;
-        e.event_type  = "ERROR";
-        e.reason      = "MA_BUFFER_COPY_FAIL";
-        e.last_error  = GetLastError();
-        e.session_state = sessionState;
-        g_logger.LogEvent(LOG_LEVEL_ERRORS, e);
-        return;
-    }
+    bool maBuy  = (maSig.signal == "BUY");
+    bool maSell = (maSig.signal == "SELL");
 
-    // インデックス: [0]=1本前, [1]=2本前
-    double shortMaPrev = shortMa[1];
-    double shortMaCurr = shortMa[0];
-    double longMaPrev  = longMa[1];
-    double longMaCurr  = longMa[0];
-
-    bool buySignal  = (shortMaPrev <= longMaPrev) && (shortMaCurr > longMaCurr);
-    bool sellSignal = (shortMaPrev >= longMaPrev) && (shortMaCurr < longMaCurr);
-
-    // VerboseLog: MA値とクロス方向
+    // VerboseLog: MAクロス情報
     if (VerboseLog)
     {
         string crossDir = "なし";
-        if (buySignal)  crossDir = "ゴールデンクロス(買い)";
-        if (sellSignal) crossDir = "デッドクロス(売り)";
-        Print("MA情報 | FastMA(前):", DoubleToString(shortMaPrev, 5),
-              " FastMA(現):", DoubleToString(shortMaCurr, 5),
-              " | SlowMA(前):", DoubleToString(longMaPrev, 5),
-              " SlowMA(現):", DoubleToString(longMaCurr, 5),
+        if (maBuy)  crossDir = "ゴールデンクロス(買い)";
+        if (maSell) crossDir = "デッドクロス(売り)";
+        Print("MA情報 | FastMA(前):", DoubleToString(maSig.shortMaPrev, 5),
+              " FastMA(現):", DoubleToString(maSig.shortMaCurr, 5),
+              " | SlowMA(前):", DoubleToString(maSig.longMaPrev, 5),
+              " SlowMA(現):", DoubleToString(maSig.longMaCurr, 5),
               " | クロス:", crossDir);
     }
 
-    // SIGNAL イベント（シグナルあり時のみ、詳細レベル）
-    if (buySignal || sellSignal)
+    // MAクロス SIGNALイベント（詳細レベル）
+    if (maBuy || maSell)
     {
         SLogEntry e;
         e.event_type    = "SIGNAL";
-        e.side          = buySignal ? "BUY" : "SELL";
-        e.reason        = buySignal ? "MA_CROSS_UP" : "MA_CROSS_DOWN";
-        e.fast_ma_value = shortMaCurr;
-        e.slow_ma_value = longMaCurr;
+        e.side          = maBuy ? "BUY" : "SELL";
+        e.reason        = maSig.reason;
+        e.fast_ma_value = maSig.shortMaCurr;
+        e.slow_ma_value = maSig.longMaCurr;
         e.price_bid     = bid;
         e.price_ask     = ask;
         e.spread_points = spread;
@@ -626,10 +650,62 @@ void OnTick()
         g_logger.LogEvent(LOG_LEVEL_VERBOSE, e);
     }
 
-    // 上位足トレンドフィルタ
+    // ブレイクアウト戦略評価
+    bool boBuy  = false;
+    bool boSell = false;
+    SStrategySignal boSig;
+    if (EnableBreakoutStrategy)
+    {
+        boSig = EvaluateBreakout(InpSymbol, BreakoutLookbackBars, BreakoutBufferPoints);
+        if (boSig.error)
+        {
+            if (VerboseLog)
+                Print("ブレイクアウト価格データ取得失敗 | reason:", boSig.reason);
+            SLogEntry e;
+            e.event_type    = "ERROR";
+            e.reason        = boSig.reason;
+            e.last_error    = GetLastError();
+            e.session_state = sessionState;
+            g_logger.LogEvent(LOG_LEVEL_ERRORS, e);
+            // エラー時はブレイクアウトシグナルを NONE として扱い継続
+        }
+        else
+        {
+            boBuy  = (boSig.signal == "BUY");
+            boSell = (boSig.signal == "SELL");
+
+            // ブレイクアウト SIGNALイベント + 詳細ログ（LogLevel=2 のみ）
+            if (boBuy || boSell)
+            {
+                if (LogLevel >= LOG_LEVEL_VERBOSE)
+                    Print("ブレイクアウト情報 | Lookback:", BreakoutLookbackBars,
+                          " | HighestHigh:", DoubleToString(boSig.boHighestHigh, 5),
+                          " | LowestLow:", DoubleToString(boSig.boLowestLow, 5),
+                          " | Buffer:", DoubleToString(BreakoutBufferPoints * point, 5),
+                          " | Ask:", DoubleToString(ask, (int)SymbolInfoInteger(InpSymbol, SYMBOL_DIGITS)),
+                          " | Bid:", DoubleToString(bid, (int)SymbolInfoInteger(InpSymbol, SYMBOL_DIGITS)),
+                          " | Signal:", boSig.signal);
+
+                SLogEntry e;
+                e.event_type    = "SIGNAL";
+                e.side          = boBuy ? "BUY" : "SELL";
+                e.reason        = boSig.reason;
+                e.price_bid     = bid;
+                e.price_ask     = ask;
+                e.spread_points = spread;
+                e.session_state = sessionState;
+                g_logger.LogEvent(LOG_LEVEL_VERBOSE, e);
+            }
+        }
+    }
+
+    // --- 上位足トレンドフィルタ（共通ゲート：方向フィルタ） ---
     double htfFastMaVal = 0.0, htfSlowMaVal = 0.0;
-    string htfTrend = "";
-    if (EnableHigherTimeframeFilter && (buySignal || sellSignal))
+    string htfTrend     = "";
+    bool   anyBuy       = maBuy  || boBuy;
+    bool   anySell      = maSell || boSell;
+
+    if (EnableHigherTimeframeFilter && (anyBuy || anySell))
     {
         double htfFastBuf[1], htfSlowBuf[1];
         bool htfOk = (CopyBuffer(g_htfFastMaHandle, 0, 1, 1, htfFastBuf) >= 1) &&
@@ -643,8 +719,7 @@ void OnTick()
             e.last_error    = GetLastError();
             e.session_state = sessionState;
             g_logger.LogEvent(LOG_LEVEL_ERRORS, e);
-            buySignal  = false;
-            sellSignal = false;
+            maBuy = maSell = boBuy = boSell = false;
         }
         else
         {
@@ -659,18 +734,22 @@ void OnTick()
                       " | SlowMA:", DoubleToString(htfSlowMaVal, 5),
                       " | Trend:", htfTrend);
 
-            // BUYシグナルが上位足DOWN（fastMA < slowMA）またはFLAT（fastMA == slowMA）と不一致 → ブロック
-            if (buySignal && htfFastMaVal <= htfSlowMaVal)
+            // BUYシグナルが上位足方向と不一致（DOWN or FLAT）→ ブロック
+            if (anyBuy && htfFastMaVal <= htfSlowMaVal)
             {
+                string blockedReason = "";
+                if (maBuy) blockedReason += (blockedReason == "" ? "" : "+") + maSig.reason;
+                if (boBuy) blockedReason += (blockedReason == "" ? "" : "+") + boSig.reason;
                 if (VerboseLog)
-                    Print("エントリー見送り | 理由: 上位足トレンド不一致 | シグナル:BUY | HTF:", htfTrend);
+                    Print("エントリー見送り | 理由: 上位足トレンド不一致 | シグナル:BUY | HTF:", htfTrend,
+                          " | ブロック対象:", blockedReason);
 
                 SLogEntry e;
                 e.event_type        = "SKIP_SYMBOL";
                 e.side              = "BUY";
                 e.reason            = "HTF_FILTER_BLOCKED";
-                e.fast_ma_value     = shortMaCurr;
-                e.slow_ma_value     = longMaCurr;
+                e.fast_ma_value     = maSig.shortMaCurr;
+                e.slow_ma_value     = maSig.longMaCurr;
                 e.htf_fast_ma_value = htfFastMaVal;
                 e.htf_slow_ma_value = htfSlowMaVal;
                 e.htf_trend         = htfTrend;
@@ -679,21 +758,26 @@ void OnTick()
                 e.spread_points     = spread;
                 e.session_state     = sessionState;
                 g_logger.LogEvent(LOG_LEVEL_TRADES, e);
-                buySignal = false;
+                maBuy = false;
+                boBuy = false;
             }
 
-            // SELLシグナルが上位足UP（fastMA > slowMA）またはFLAT（fastMA == slowMA）と不一致 → ブロック
-            if (sellSignal && htfFastMaVal >= htfSlowMaVal)
+            // SELLシグナルが上位足方向と不一致（UP or FLAT）→ ブロック
+            if (anySell && htfFastMaVal >= htfSlowMaVal)
             {
+                string blockedReason = "";
+                if (maSell) blockedReason += (blockedReason == "" ? "" : "+") + maSig.reason;
+                if (boSell) blockedReason += (blockedReason == "" ? "" : "+") + boSig.reason;
                 if (VerboseLog)
-                    Print("エントリー見送り | 理由: 上位足トレンド不一致 | シグナル:SELL | HTF:", htfTrend);
+                    Print("エントリー見送り | 理由: 上位足トレンド不一致 | シグナル:SELL | HTF:", htfTrend,
+                          " | ブロック対象:", blockedReason);
 
                 SLogEntry e;
                 e.event_type        = "SKIP_SYMBOL";
                 e.side              = "SELL";
                 e.reason            = "HTF_FILTER_BLOCKED";
-                e.fast_ma_value     = shortMaCurr;
-                e.slow_ma_value     = longMaCurr;
+                e.fast_ma_value     = maSig.shortMaCurr;
+                e.slow_ma_value     = maSig.longMaCurr;
                 e.htf_fast_ma_value = htfFastMaVal;
                 e.htf_slow_ma_value = htfSlowMaVal;
                 e.htf_trend         = htfTrend;
@@ -702,13 +786,97 @@ void OnTick()
                 e.spread_points     = spread;
                 e.session_state     = sessionState;
                 g_logger.LogEvent(LOG_LEVEL_TRADES, e);
-                sellSignal = false;
+                maSell = false;
+                boSell = false;
             }
         }
     }
 
-    // 買いシグナル: 売りポジションを逆シグナル決済 → 買いエントリー
-    if (buySignal)
+    // --- OR集約 ---
+    bool finalBuy  = maBuy  || boBuy;
+    bool finalSell = maSell || boSell;
+
+    // 戦略ごとのreason文字列を構築
+    string buyReasonStr  = "";
+    string sellReasonStr = "";
+    if (maBuy)  buyReasonStr  += (buyReasonStr  == "" ? "" : "+") + maSig.reason;
+    if (boBuy)  buyReasonStr  += (buyReasonStr  == "" ? "" : "+") + boSig.reason;
+    if (maSell) sellReasonStr += (sellReasonStr == "" ? "" : "+") + maSig.reason;
+    if (boSell) sellReasonStr += (sellReasonStr == "" ? "" : "+") + boSig.reason;
+
+    // --- コンフリクトチェック（同一バーでBUYとSELLが同時に出たら見送り） ---
+    if (finalBuy && finalSell)
+    {
+        string detail = "BUY(" + buyReasonStr + ")+SELL(" + sellReasonStr + ")";
+        if (VerboseLog)
+            Print("エントリー見送り | 理由: シグナルコンフリクト | ", detail);
+
+        SLogEntry e;
+        e.event_type    = "SKIP_SYMBOL";
+        e.side          = "NONE";
+        e.reason        = "SIGNAL_CONFLICT";
+        e.fast_ma_value = maSig.shortMaCurr;
+        e.slow_ma_value = maSig.longMaCurr;
+        e.price_bid     = bid;
+        e.price_ask     = ask;
+        e.spread_points = spread;
+        e.session_state = sessionState;
+        g_logger.LogEvent(LOG_LEVEL_TRADES, e);
+        return;
+    }
+
+    // シグナルなし
+    if (!finalBuy && !finalSell)
+    {
+        if (VerboseLog) Print("エントリー見送り | 理由: シグナルなし");
+        return;
+    }
+
+    // --- 取引回数制限チェック ---
+    string entrySide   = finalBuy ? "BUY" : "SELL";
+    string entryReason = finalBuy ? buyReasonStr : sellReasonStr;
+
+    if (DailyMaxTrades > 0 && g_dailyTradeCount >= DailyMaxTrades)
+    {
+        if (VerboseLog)
+            Print("エントリー見送り | 理由: 日次取引上限 | 本日:", g_dailyTradeCount,
+                  "回 / 上限:", DailyMaxTrades, "回");
+
+        SLogEntry e;
+        e.event_type    = "SKIP_SYMBOL";
+        e.side          = entrySide;
+        e.reason        = "DAILY_TRADE_LIMIT";
+        e.price_bid     = bid;
+        e.price_ask     = ask;
+        e.spread_points = spread;
+        e.session_state = sessionState;
+        g_logger.LogEvent(LOG_LEVEL_TRADES, e);
+        return;
+    }
+
+    if (MinMinutesBetweenEntries > 0 && g_lastEntryTime > 0 &&
+        TimeCurrent() < g_lastEntryTime + MinMinutesBetweenEntries * 60)
+    {
+        int remainMin = (int)((g_lastEntryTime + MinMinutesBetweenEntries * 60 - TimeCurrent() + 59) / 60); // +59 で切り上げ
+        if (VerboseLog)
+            Print("エントリー見送り | 理由: エントリー間隔未達 | 残り約:", remainMin, "分");
+
+        SLogEntry e;
+        e.event_type    = "SKIP_SYMBOL";
+        e.side          = entrySide;
+        e.reason        = "ENTRY_TOO_SOON";
+        e.price_bid     = bid;
+        e.price_ask     = ask;
+        e.spread_points = spread;
+        e.session_state = sessionState;
+        g_logger.LogEvent(LOG_LEVEL_TRADES, e);
+        return;
+    }
+
+    // --- エントリー実行 ---
+
+    // BUYエントリー
+    if (finalBuy)
     {
         ClosePositionsByType(POSITION_TYPE_SELL);
 
@@ -730,8 +898,8 @@ void OnTick()
                 e.event_type    = "SKIP_SYMBOL";
                 e.side          = "BUY";
                 e.reason        = "INSUFFICIENT_MARGIN";
-                e.fast_ma_value = shortMaCurr;
-                e.slow_ma_value = longMaCurr;
+                e.fast_ma_value = maSig.shortMaCurr;
+                e.slow_ma_value = maSig.longMaCurr;
                 e.price_bid     = bid;
                 e.price_ask     = ask;
                 e.spread_points = spread;
@@ -743,17 +911,22 @@ void OnTick()
             {
                 bool ok = Trade.Buy(lot, InpSymbol, ask, sl, tp, "SimpleScalper Buy");
                 if (ok)
+                {
+                    g_dailyTradeCount++;
+                    g_lastEntryTime = TimeCurrent();
                     Print("エントリー実行 | BUY | Ask:", DoubleToString(ask, (int)SymbolInfoInteger(InpSymbol, SYMBOL_DIGITS)),
                           " | SL:", DoubleToString(sl, (int)SymbolInfoInteger(InpSymbol, SYMBOL_DIGITS)),
                           " | TP:", DoubleToString(tp, (int)SymbolInfoInteger(InpSymbol, SYMBOL_DIGITS)),
-                          " | Lot:", DoubleToString(lot, 2));
+                          " | Lot:", DoubleToString(lot, 2),
+                          " | Strategy:", entryReason);
+                }
 
                 SLogEntry e;
                 e.event_type    = ok ? "ENTRY" : "ERROR";
                 e.side          = "BUY";
-                e.reason        = ok ? "MA_CROSS_UP" : "ORDER_SEND_FAIL";
-                e.fast_ma_value = shortMaCurr;
-                e.slow_ma_value = longMaCurr;
+                e.reason        = ok ? entryReason : "ORDER_SEND_FAIL";
+                e.fast_ma_value = maSig.shortMaCurr;
+                e.slow_ma_value = maSig.longMaCurr;
                 e.price_bid     = bid;
                 e.price_ask     = ask;
                 e.spread_points = spread;
@@ -774,8 +947,8 @@ void OnTick()
         }
     }
 
-    // 売りシグナル: 買いポジションを逆シグナル決済 → 売りエントリー
-    if (sellSignal)
+    // SELLエントリー
+    if (finalSell)
     {
         ClosePositionsByType(POSITION_TYPE_BUY);
 
@@ -797,8 +970,8 @@ void OnTick()
                 e.event_type    = "SKIP_SYMBOL";
                 e.side          = "SELL";
                 e.reason        = "INSUFFICIENT_MARGIN";
-                e.fast_ma_value = shortMaCurr;
-                e.slow_ma_value = longMaCurr;
+                e.fast_ma_value = maSig.shortMaCurr;
+                e.slow_ma_value = maSig.longMaCurr;
                 e.price_bid     = bid;
                 e.price_ask     = ask;
                 e.spread_points = spread;
@@ -810,17 +983,22 @@ void OnTick()
             {
                 bool ok = Trade.Sell(lot, InpSymbol, bid, sl, tp, "SimpleScalper Sell");
                 if (ok)
+                {
+                    g_dailyTradeCount++;
+                    g_lastEntryTime = TimeCurrent();
                     Print("エントリー実行 | SELL | Bid:", DoubleToString(bid, (int)SymbolInfoInteger(InpSymbol, SYMBOL_DIGITS)),
                           " | SL:", DoubleToString(sl, (int)SymbolInfoInteger(InpSymbol, SYMBOL_DIGITS)),
                           " | TP:", DoubleToString(tp, (int)SymbolInfoInteger(InpSymbol, SYMBOL_DIGITS)),
-                          " | Lot:", DoubleToString(lot, 2));
+                          " | Lot:", DoubleToString(lot, 2),
+                          " | Strategy:", entryReason);
+                }
 
                 SLogEntry e;
                 e.event_type    = ok ? "ENTRY" : "ERROR";
                 e.side          = "SELL";
-                e.reason        = ok ? "MA_CROSS_DOWN" : "ORDER_SEND_FAIL";
-                e.fast_ma_value = shortMaCurr;
-                e.slow_ma_value = longMaCurr;
+                e.reason        = ok ? entryReason : "ORDER_SEND_FAIL";
+                e.fast_ma_value = maSig.shortMaCurr;
+                e.slow_ma_value = maSig.longMaCurr;
                 e.price_bid     = bid;
                 e.price_ask     = ask;
                 e.spread_points = spread;
@@ -840,9 +1018,6 @@ void OnTick()
             if (VerboseLog) Print("エントリー見送り | 理由: 最大ポジション数上限 | ポジション数:", CountPositions());
         }
     }
-
-    if (VerboseLog && !buySignal && !sellSignal)
-        Print("エントリー見送り | 理由: MAクロスシグナルなし");
 }
 
 //+------------------------------------------------------------------+
