@@ -66,6 +66,12 @@ input int   BreakoutLookbackBars     = 20;   // ブレイクアウト判定の�
 input int   BreakoutBufferPoints     = 2;    // ブレイクアウトバッファ（ポイント）
 input bool  BreakoutConfirmByClose   = true; // 終値確定版を使用する（true=精度優先, false=Ask/Bid）
 
+//--- ATRフィルタ（低ボラ・ノイズ相場回避）
+input bool            EnableATRFilter  = false;         // ATRフィルタを有効にする（デフォルトOFF＝後方互換）
+input ENUM_TIMEFRAMES ATRTimeframe     = PERIOD_CURRENT; // ATRフィルタ用タイムフレーム
+input int             ATRPeriod        = 14;            // ATR計算期間
+input int             MinATRPoints     = 20;            // 最小ATR閾値（ポイント）。これ未満のバーはエントリーを見送る
+
 //--- 取引回数制限（安全弁）
 input int   DailyMaxTrades           = 10;  // 1日の最大取引回数（0=無制限, JSTベース）
 input int   MinMinutesBetweenEntries = 5;   // エントリー間隔の最小時間（分, 0=無制限）
@@ -93,6 +99,9 @@ datetime g_cooldownUntil   = 0;
 // 上位足MAハンドル
 int      g_htfFastMaHandle = INVALID_HANDLE;
 int      g_htfSlowMaHandle = INVALID_HANDLE;
+
+// ATRハンドル
+int      g_atrHandle       = INVALID_HANDLE;
 
 // 取引回数管理（JSTベース日次カウント）
 int      g_dailyTradeCount = 0;          // 本日の取引回数
@@ -423,6 +432,22 @@ int OnInit()
         }
     }
 
+    // ATRハンドル初期化
+    if (EnableATRFilter)
+    {
+        if (ATRPeriod <= 0)
+        {
+            Alert("ATRフィルタ: ATRPeriodは正の値を設定してください。");
+            return INIT_FAILED;
+        }
+        g_atrHandle = iATR(g_symbol, ATRTimeframe, ATRPeriod);
+        if (g_atrHandle == INVALID_HANDLE)
+        {
+            Alert("ATRインジケータの初期化に失敗しました。");
+            return INIT_FAILED;
+        }
+    }
+
     Trade.SetExpertMagicNumber(InpMagicNumber);
     Trade.SetDeviationInPoints(10);
 
@@ -448,6 +473,8 @@ int OnInit()
           " | HTFFilter:", (EnableHigherTimeframeFilter ? "ON" : "OFF"),
           " | Breakout:", (EnableBreakoutStrategy ? "ON" : "OFF"),
           " | BreakoutConfirmByClose:", (BreakoutConfirmByClose ? "ON" : "OFF"),
+          " | ATRFilter:", (EnableATRFilter ? "ON" : "OFF"),
+          " | MinATRPoints:", MinATRPoints,
           " | DailyMaxTrades:", DailyMaxTrades,
           " | MinMinutesBetweenEntries:", MinMinutesBetweenEntries);
     Print("時刻情報 | Server:", TimeToString(serverNow, TIME_DATE|TIME_MINUTES),
@@ -483,6 +510,7 @@ void OnDeinit(const int reason)
     if (g_longMaHandle  != INVALID_HANDLE) IndicatorRelease(g_longMaHandle);
     if (g_htfFastMaHandle != INVALID_HANDLE) IndicatorRelease(g_htfFastMaHandle);
     if (g_htfSlowMaHandle != INVALID_HANDLE) IndicatorRelease(g_htfSlowMaHandle);
+    if (g_atrHandle       != INVALID_HANDLE) IndicatorRelease(g_atrHandle);
     g_logger.Deinit();
 }
 
@@ -837,6 +865,52 @@ void OnTick()
     {
         if (VerboseLog) Print("エントリー見送り | 理由: シグナルなし");
         return;
+    }
+
+    // --- ATRフィルタ（低ボラ・ノイズ相場回避） ---
+    // ここに到達した時点で finalBuy || finalSell が保証されている（NONEは上の return で抜けている）
+    // EnableATRFilter=false のとき完全スキップ（後方互換）
+    if (EnableATRFilter)
+    {
+        double atrBuf[1];
+        if (CopyBuffer(g_atrHandle, 0, 1, 1, atrBuf) < 1)
+        {
+            // バッファ取得失敗: エラーログを残してフィルタをスキップ（EA停止させない）
+            Print("ATRバッファ取得失敗 | reason:ATR_BUFFER_COPY_FAIL | error:", GetLastError());
+            SLogEntry e;
+            e.event_type    = "ERROR";
+            e.reason        = "ATR_BUFFER_COPY_FAIL";
+            e.side          = finalBuy ? "BUY" : "SELL";
+            e.last_error    = GetLastError();
+            e.price_bid     = bid;
+            e.price_ask     = ask;
+            e.spread_points = spread;
+            e.session_state = sessionState;
+            g_logger.LogEvent(LOG_LEVEL_ERRORS, e);
+            // フィルタは通過扱いで続行
+        }
+        else
+        {
+            double atrPoints = (point > 0) ? atrBuf[0] / point : 0.0;
+            if (atrPoints < MinATRPoints)
+            {
+                if (VerboseLog)
+                    Print("エントリー見送り | 理由: ATR低すぎ | ATR:", DoubleToString(atrPoints, 1),
+                          "pts < 最小:", MinATRPoints, "pts");
+
+                SLogEntry e;
+                e.event_type    = "SKIP_SYMBOL";
+                e.side          = finalBuy ? "BUY" : "SELL";
+                e.reason        = "ATR_TOO_LOW";
+                e.price_bid     = bid;
+                e.price_ask     = ask;
+                e.spread_points = spread;
+                e.atr_value     = atrPoints;
+                e.session_state = sessionState;
+                g_logger.LogEvent(LOG_LEVEL_TRADES, e);
+                return;
+            }
+        }
     }
 
     // --- 取引回数制限チェック ---
