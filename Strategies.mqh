@@ -3,7 +3,7 @@
 //|                        複数戦略シグナル評価モジュール              |
 //|  使用方法:                                                        |
 //|    SStrategySignal sig = EvaluateMACross(shortHandle, longHandle);|
-//|    SStrategySignal sig = EvaluateBreakout(symbol, N, buf);       |
+//|    SStrategySignal sig = EvaluateBreakout(symbol, N, buf, close); |
 //+------------------------------------------------------------------+
 #property strict
 
@@ -91,17 +91,23 @@ SStrategySignal EvaluateMACross(int shortMaHandle, int longMaHandle)
 //| ブレイクアウト戦略評価                                            |
 //|                                                                  |
 //| 稼働足（PERIOD_CURRENT）の直近 lookbackBars 本の確定足（bar 1〜N）|
-//| の高値/安値を計算し、現在価格がブレイクアウトしているか判定する。  |
+//| の高値/安値を計算し、ブレイクアウトを判定する。                    |
 //|                                                                  |
-//| BUY 条件 : Ask >= 直近N本高値 + buffer                           |
-//| SELL条件 : Bid <= 直近N本安値 - buffer                           |
+//| confirmByClose=true（デフォルト・精度優先）の場合:               |
+//|   BUY 条件 : Close[1] >= 直近N本高値 + buffer                   |
+//|   SELL条件 : Close[1] <= 直近N本安値 - buffer                   |
+//|                                                                  |
+//| confirmByClose=false（後方互換）の場合:                          |
+//|   BUY 条件 : Ask >= 直近N本高値 + buffer                        |
+//|   SELL条件 : Bid <= 直近N本安値 - buffer                        |
 //|                                                                  |
 //| 返り値: SStrategySignal                                          |
 //|   signal = "BUY"  → 上方ブレイクアウト（BREAKOUT_UP）           |
 //|   signal = "SELL" → 下方ブレイクアウト（BREAKOUT_DOWN）          |
 //|   signal = "NONE" → ブレイクアウトなし / エラー                 |
 //+------------------------------------------------------------------+
-SStrategySignal EvaluateBreakout(const string symbol, int lookbackBars, int bufferPoints)
+SStrategySignal EvaluateBreakout(const string symbol, int lookbackBars, int bufferPoints,
+                                  bool confirmByClose = true)
 {
    SStrategySignal result;
 
@@ -126,15 +132,33 @@ SStrategySignal EvaluateBreakout(const string symbol, int lookbackBars, int buff
    result.boHighestHigh = highArray[highIdx];
    result.boLowestLow   = lowArray[lowIdx];
 
-   double ask = SymbolInfoDouble(symbol, SYMBOL_ASK);
-   double bid = SymbolInfoDouble(symbol, SYMBOL_BID);
+   double triggerHigh, triggerLow;
+   if (confirmByClose)
+   {
+      // 終値確定版: 直近確定足（bar 1）の終値で判定（ヒゲだまし低減）
+      double closeArr[1];
+      if (CopyClose(symbol, PERIOD_CURRENT, 1, 1, closeArr) < 1)
+      {
+         result.error  = true;
+         result.reason = "CLOSE_PRICE_COPY_FAIL";
+         return result;
+      }
+      triggerHigh = closeArr[0];
+      triggerLow  = closeArr[0];
+   }
+   else
+   {
+      // 後方互換: 現在の Ask/Bid で判定
+      triggerHigh = SymbolInfoDouble(symbol, SYMBOL_ASK);
+      triggerLow  = SymbolInfoDouble(symbol, SYMBOL_BID);
+   }
 
-   if (ask >= result.boHighestHigh + buffer)
+   if (triggerHigh >= result.boHighestHigh + buffer)
    {
       result.signal = "BUY";
       result.reason = "BREAKOUT_UP";
    }
-   else if (bid <= result.boLowestLow - buffer)
+   else if (triggerLow <= result.boLowestLow - buffer)
    {
       result.signal = "SELL";
       result.reason = "BREAKOUT_DOWN";

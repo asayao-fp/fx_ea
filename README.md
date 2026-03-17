@@ -1,7 +1,7 @@
-# SimpleScalper — USDJPY限定 マルチ戦略スキャルピングEA
+# SimpleScalper — マルチ通貨対応 マルチ戦略スキャルピングEA
 
 MT5（MetaTrader 5）用のスキャルピングEAです。  
-USDJPY専用・取引時間帯制限付き（JST対応）・**複数戦略の並行評価（OR型）**によるエントリーロジック・スプレッドフィルタを実装しています。
+**チャートのシンボルに自動追従**（`InpSymbol` 空欄でチャート通貨ペアで動作）・取引時間帯制限付き（JST対応）・**複数戦略の並行評価（OR型）**によるエントリーロジック・スプレッドフィルタを実装しています。
 
 ---
 
@@ -24,6 +24,9 @@ USDJPY専用・取引時間帯制限付き（JST対応）・**複数戦略の並
   ├── BUY + SELL → 見送り（SIGNAL_CONFLICT）
   └── どちらもなし → 見送り
           ↓ エントリー可の場合
+新規エントリーゲート（同時ポジ禁止）
+  └── ポジション保有中 → 見送り（POSITION_ALREADY_OPEN）
+          ↓ ポジションなしの場合のみ
 取引回数制限（安全弁）
   ├── DailyMaxTrades（日次上限）
   └── MinMinutesBetweenEntries（間隔制限）
@@ -35,9 +38,10 @@ USDJPY専用・取引時間帯制限付き（JST対応）・**複数戦略の並
 
 | 項目 | 内容 |
 |------|------|
-| 通貨ペア | USDJPY 固定 |
+| 通貨ペア | チャートのシンボルに自動追従（`InpSymbol` 空欄時）。または `InpSymbol` で明示指定 |
 | 取引時間帯 | 8:00〜11:00 / 16:00〜18:00 / 21:00〜24:00（JST基準、`UseJST=true`の場合） |
 | エントリー戦略 | **MAクロス**（短期MAが長期MAを上抜け→買い、下抜け→売り）または **ブレイクアウト**（直近N本高値/安値を更新→BUY/SELL）。どちらかがシグナルを出せばエントリー（OR型）。両方から逆方向シグナルが出た場合は見送り（安全優先）。 |
+| 同時ポジ禁止 | 同一シンボル・同一MagicNumberのポジションを1つでも保有中は新規エントリーしない。 |
 | 決済 | 固定TP/SL、逆シグナル発生時の即決済、または時間切れ（MaxBarsInTrade） |
 | バー確認 | 新規バー開始時のみシグナルを評価（バー確定後エントリー） |
 | スプレッドフィルタ | スプレッドが `MaxSpreadPoints` を超える場合はエントリーしない |
@@ -50,9 +54,9 @@ USDJPY専用・取引時間帯制限付き（JST対応）・**複数戦略の並
 
 | パラメータ | デフォルト | 説明 |
 |-----------|-----------|------|
-| `InpSymbol` | `USDJPY` | 取引通貨ペア（変更不可） |
+| `InpSymbol` | `""` | 取引通貨ペア。**空欄（デフォルト）のときはチャートのシンボルを使用**。明示指定も可（例: `EURUSD`） |
 | `InpMagicNumber` | `20240001` | EA識別用マジックナンバー |
-| `InpMaxPositions` | `3` | 同時保有最大ポジション数 |
+| `InpMaxPositions` | `3` | 同時保有最大ポジション数（`POSITION_ALREADY_OPEN` チェックを通過した後のサブ制限） |
 | `InpTakeProfit` | `200` | テイクプロフィット（ポイント） |
 | `InpStopLoss` | `100` | ストップロス（ポイント） |
 
@@ -127,8 +131,22 @@ USDJPY専用・取引時間帯制限付き（JST対応）・**複数戦略の並
 | `EnableBreakoutStrategy` | `true` | ブレイクアウト戦略を有効にする |
 | `BreakoutLookbackBars` | `20` | ブレイクアウト判定の参照バー数（確定足のみ。現在形成中の足は含まない） |
 | `BreakoutBufferPoints` | `2` | ブレイクアウト判定のバッファ（ポイント） |
+| `BreakoutConfirmByClose` | `true` | **終値確定版**を使用する（`true`=精度優先・デフォルト, `false`=Ask/Bid・後方互換） |
 
 稼働足（`PERIOD_CURRENT`）の直近 `BreakoutLookbackBars` 本の**確定足**の高値/安値を基準にブレイクアウトを判定します。
+
+#### `BreakoutConfirmByClose=true`（デフォルト・推奨）
+
+直近確定足（bar 1）の**終値**でブレイクアウトを判定します。ヒゲだましや一時的な価格突破に騙されにくくなります。
+
+| 条件 | シグナル |
+|------|--------|
+| `Close[1] >= 直近N本高値 + バッファ` | BUY |
+| `Close[1] <= 直近N本安値 - バッファ` | SELL |
+
+#### `BreakoutConfirmByClose=false`（後方互換）
+
+現在の Ask/Bid 価格でリアルタイム判定します（PR #9以前の挙動）。
 
 | 条件 | シグナル |
 |------|--------|
@@ -156,7 +174,21 @@ USDJPY専用・取引時間帯制限付き（JST対応）・**複数戦略の並
 | `LogLevel` | `1` | ログ出力レベル（`0`=エラーのみ, `1`=取引イベント, `2`=全詳細） |
 | `UseServerTimeForSessions` | `false` | `true` のとき取引時間帯判定にサーバ時刻を使用（`false` のとき `UseJST` 設定を使用） |
 
-> **注意**: USDJPYチャートの場合、1ポイント ≒ 0.001円相当（5桁ブローカーでは `100ポイント = 約1銭`）。
+> **注意**: 1ポイントの値はシンボルによって異なります。USDJPYの場合は1ポイント ≒ 0.001円相当（5桁ブローカーでは `100ポイント = 約1銭`）。EURUSD等の場合は `100ポイント ≒ 0.1 pips`。**通貨ペアを変える際は `TP/SL/MaxSpreadPoints/BreakoutBufferPoints` などをシンボルのPoint単位に合わせて調整してください。**
+
+---
+
+## チャートシンボル追従（別通貨での運用）
+
+`InpSymbol` を空欄（デフォルト）にすると、EAをアタッチしたチャートのシンボルで自動的に動作します。USDJPYチャートならUSDJPY、EURUSDチャートならEURUSDで取引します。
+
+複数シンボルで同時に稼働する場合は、チャートごとに **`InpMagicNumber`** と **`LogFileName`** を変えて起動してください（例: USDJPY=20240001, EURUSD=20240002）。
+
+> **重要**: シンボルによってポイント単位が異なります。別通貨で使う場合は以下のパラメータをシンボルに合わせて調整してください：
+> - `InpTakeProfit` / `InpStopLoss`（ポイント単位。通貨・桁数によって同じ損益が異なる）
+> - `MaxSpreadPoints`（各通貨のスプレッドに合わせた値に変更）
+> - `BreakoutBufferPoints`（各通貨のボラティリティに合わせた値に変更）
+> - `SpreadSpikeThresholdPoints`（通貨によってスパイク閾値が変わる）
 
 ---
 
@@ -288,11 +320,12 @@ SimpleScalper 初期化完了 | Magic:20240001 | LotMode:RiskPercent | RiskPerce
 ## 設置方法
 
 1. MetaEditor（MT5付属）を開く
-2. `SimpleScalper.mq5` を `MQL5/Experts/` フォルダにコピー
+2. `SimpleScalper.mq5`（と `Logger.mqh`、`Strategies.mqh`）を `MQL5/Experts/` フォルダにコピー
 3. MetaEditorで`F7`キーを押してコンパイル（エラーがないことを確認）
 4. MT5のナビゲーターウィンドウ → **エキスパートアドバイザー** に `SimpleScalper` が表示される
-5. **USDJPYチャート**（推奨：M5またはM15）へドラッグ＆ドロップ
-6. パラメータを設定し「自動売買を許可する」にチェックを入れてOK
+5. **任意のシンボルのチャート**（推奨：M5またはM15）へドラッグ＆ドロップ
+6. `InpSymbol` は空欄（デフォルト）のままにするとチャートのシンボルで動作（USDJPY以外も可）
+7. パラメータを設定し「自動売買を許可する」にチェックを入れてOK
 
 ---
 
@@ -303,7 +336,7 @@ SimpleScalper 初期化完了 | Magic:20240001 | LotMode:RiskPercent | RiskPerce
 1. MT5メニュー → **表示 → ストラテジーテスター**（Ctrl+R）を開く
 2. 以下を設定：
    - **エキスパート**: `SimpleScalper`
-   - **シンボル**: `USDJPY`
+   - **シンボル**: テストしたい通貨ペア（例: `USDJPY`、`EURUSD` など）
    - **タイムフレーム**: `M5`（または`M15`）
    - **モデリング**: `全ティック`（精度優先）または `始値のみ`（高速確認用）
    - **期間**: 任意（直近3〜6ヶ月推奨）
@@ -313,9 +346,9 @@ SimpleScalper 初期化完了 | Magic:20240001 | LotMode:RiskPercent | RiskPerce
 ### デモ口座リアルタイム動作確認
 
 1. デモ口座でMT5にログイン
-2. USDJPYチャートにEAをアタッチ
+2. 任意のシンボルのチャートにEAをアタッチ（`InpSymbol` 空欄でチャートシンボルに追従）
 3. MT5ツールバーの **自動売買**ボタン（緑の矢印）がオンになっていることを確認
-4. 取引時間帯（JST 8-11時、16-18時、21-24時）にMAクロスが発生するとエントリーされることを確認
+4. 取引時間帯（JST 8-11時、16-18時、21-24時）にMAクロスまたはブレイクアウトが発生するとエントリーされることを確認
 5. **エキスパートタブ**のログでEAの動作状況を確認
 
 ---
@@ -394,6 +427,7 @@ SimpleScalper 初期化完了 | Magic:20240001 | LotMode:RiskPercent | RiskPerce
 | `BREAKOUT_DOWN` | 下方ブレイクアウト（ブレイクアウト戦略 売りシグナル） |
 | `MA_CROSS_UP+BREAKOUT_UP` | 複数戦略が同じ方向に一致した場合の複合reason（例） |
 | `SIGNAL_CONFLICT` | 同一バーでBUYとSELLが同時に出たため見送り（`SKIP_SYMBOL` 行） |
+| `POSITION_ALREADY_OPEN` | 同一シンボル・同一MagicNumberのポジション保有中のため新規エントリー見送り（`SKIP_SYMBOL` 行） |
 | `DAILY_TRADE_LIMIT` | 日次取引上限に達したため見送り（`SKIP_SYMBOL` 行） |
 | `ENTRY_TOO_SOON` | 前回エントリーから最小間隔未達のため見送り（`SKIP_SYMBOL` 行） |
 | `REVERSE_SIGNAL` | 逆シグナルによるポジション決済 |
@@ -411,6 +445,8 @@ SimpleScalper 初期化完了 | Magic:20240001 | LotMode:RiskPercent | RiskPerce
 | `INSUFFICIENT_MARGIN` | 証拠金不足 |
 | `ORDER_SEND_FAIL` | 注文送信失敗 |
 | `MA_BUFFER_COPY_FAIL` | MAバッファ取得失敗 |
+| `PRICE_BUFFER_COPY_FAIL` | ブレイクアウト用の高値/安値バッファ取得失敗 |
+| `CLOSE_PRICE_COPY_FAIL` | ブレイクアウト終値確定版の終値バッファ取得失敗 |
 | `EA_START` | EA起動（INIT イベント） |
 
 ### session_state の読み方
