@@ -21,7 +21,8 @@
    "price_bid,price_ask,spread_points,lot,sl_price,tp_price," \
    "order_ticket,position_ticket,deal_ticket,retcode,last_error,session_state," \
    "deal_reason,profit,commission,swap,deal_price," \
-   "cooldown_until,htf_fast_ma_value,htf_slow_ma_value,htf_trend"
+   "cooldown_until,htf_fast_ma_value,htf_slow_ma_value,htf_trend," \
+   "atr_value"
 
 //+------------------------------------------------------------------+
 //| ログエントリ構造体                                                |
@@ -59,6 +60,9 @@ struct SLogEntry
    double htf_slow_ma_value;   // 上位足 長期MA値
    string htf_trend;           // 上位足トレンド方向 "UP" / "DOWN" / "FLAT"
 
+   // ATRフィルタ
+   double atr_value;           // ATR値（ポイント換算。ATR_TOO_LOW スキップ行に設定）
+
    SLogEntry()
    {
       event_type    = "";
@@ -87,6 +91,7 @@ struct SLogEntry
       htf_fast_ma_value = 0.0;
       htf_slow_ma_value = 0.0;
       htf_trend         = "";
+      atr_value         = 0.0;
    }
 };
 
@@ -161,7 +166,8 @@ private:
       row += (e.cooldown_until > 0 ? FormatDT(e.cooldown_until) : "")         + ",";
       row += FormatDbl(e.htf_fast_ma_value)                                    + ",";
       row += FormatDbl(e.htf_slow_ma_value)                                    + ",";
-      row += e.htf_trend;
+      row += e.htf_trend                                                        + ",";
+      row += FormatDbl(e.atr_value, 2);
       return row;
    }
 
@@ -217,6 +223,8 @@ private:
          msg += " htfSlowMA=" + DoubleToString(e.htf_slow_ma_value, 5);
          msg += " htfTrend=" + e.htf_trend;
       }
+      if (e.atr_value > 0.0)
+         msg += " atr=" + DoubleToString(e.atr_value, 2) + "pts";
       return msg;
    }
 

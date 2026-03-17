@@ -23,13 +23,16 @@ MT5（MetaTrader 5）用のスキャルピングEAです。
   ├── SELLのみ → SELL エントリー
   ├── BUY + SELL → 見送り（SIGNAL_CONFLICT）
   └── どちらもなし → 見送り
-          ↓ エントリー可の場合
-新規エントリーゲート（同時ポジ禁止）
-  └── ポジション保有中 → 見送り（POSITION_ALREADY_OPEN）
-          ↓ ポジションなしの場合のみ
+          ↓ BUY / SELL の場合
+ATRフィルタ（有効時）
+  └── ATR < MinATRPoints → 見送り（ATR_TOO_LOW）
+          ↓ 通過した場合のみ
 取引回数制限（安全弁）
   ├── DailyMaxTrades（日次上限）
   └── MinMinutesBetweenEntries（間隔制限）
+          ↓ 通過した場合のみ
+新規エントリーゲート（同時ポジ禁止）
+  └── ポジション保有中 → 見送り（POSITION_ALREADY_OPEN）
 ```
 
 ---
@@ -154,6 +157,39 @@ MT5（MetaTrader 5）用のスキャルピングEAです。
 | `Bid <= 直近N本安値 - バッファ` | SELL |
 
 > 形成中のバー（bar 0）は除外されます。稼働足タイムフレームに自動追従します（`PERIOD_CURRENT` 使用）。
+
+### ATRフィルタ（低ボラ・ノイズ相場回避）
+
+| パラメータ | デフォルト | 説明 |
+|-----------|-----------|------|
+| `EnableATRFilter` | `false` | ATRフィルタを有効にする。**デフォルト OFF**（後方互換）。`true` にすると低ボラ相場のエントリーを抑制する |
+| `ATRTimeframe` | `PERIOD_CURRENT` | ATR計算に使用するタイムフレーム。`PERIOD_CURRENT` でチャートと同じ足 |
+| `ATRPeriod` | `14` | ATR計算期間（本数） |
+| `MinATRPoints` | `20` | エントリーを許可する最小ATR（ポイント単位）。直近確定足（bar 1）のATRがこの値**未満**のバーはエントリーを見送る |
+
+#### 判定ロジック
+
+集約後のシグナルが BUY または SELL の場合のみ評価します（NONE の場合はチェックしない）。
+
+```
+ATR(ATRTimeframe, ATRPeriod)[直近確定足（bar 1）] / Point < MinATRPoints  →  見送り（ATR_TOO_LOW）
+```
+
+> **MT5 インデックスの補足**: `bar 1` は「1本前の確定済み足」（現在形成中の `bar 0` の1つ前）を指します。ATR値は直近確定足時点のものを使用します。
+
+#### M15運用での推奨初期値（USDJPY 目安）
+
+| 相場の目安 | MinATRPoints の目安 | 備考 |
+|-----------|-------------------|------|
+| ノイズが多い低ボラ日を弾きたい（控えめ） | `15` | まずここから試す。エントリー回数の減少は少ない |
+| M15 標準的なフィルタ（推奨） | `20` | デフォルト値。低ボラの横ばい時間帯を概ねカット |
+| 高ボラ相場に絞りたい（厳しめ） | `25`〜`30` | 取引回数が減るがシグナル品質は上がりやすい |
+
+> **注意**: ATRのポイント値はシンボルによって異なります。EURUSD/GBPUSD ではUSDJPYよりポイント単位が小さいため、同じ `MinATRPoints` 値でも基準が変わります。別通貨で使う場合はバックテストで適切な値を確認してください。
+
+#### `EnableATRFilter=false`（デフォルト）の挙動
+
+ATRフィルタは完全にスキップされます。ATR計算も行われないため、以前のバージョンとまったく同じ挙動になります（後方互換）。
 
 ### 取引回数制限（安全弁）
 
@@ -400,6 +436,7 @@ SimpleScalper 初期化完了 | Magic:20240001 | LotMode:RiskPercent | RiskPerce
 | `htf_fast_ma_value` | 上位足 短期MA値（HTFフィルタ有効時のスキップ行に出力） |
 | `htf_slow_ma_value` | 上位足 長期MA値（HTFフィルタ有効時のスキップ行に出力） |
 | `htf_trend` | 上位足トレンド方向（`UP` / `DOWN` / `FLAT`）（HTFフィルタ有効時のスキップ行に出力） |
+| `atr_value` | ATR値（ポイント換算）。`ATR_TOO_LOW` スキップ行のみ設定。それ以外は空 |
 
 ### event_type 一覧
 
@@ -447,6 +484,8 @@ SimpleScalper 初期化完了 | Magic:20240001 | LotMode:RiskPercent | RiskPerce
 | `MA_BUFFER_COPY_FAIL` | MAバッファ取得失敗 |
 | `PRICE_BUFFER_COPY_FAIL` | ブレイクアウト用の高値/安値バッファ取得失敗 |
 | `CLOSE_PRICE_COPY_FAIL` | ブレイクアウト終値確定版の終値バッファ取得失敗 |
+| `ATR_TOO_LOW` | ATRが `MinATRPoints` 未満のため低ボラ相場として見送り（`SKIP_SYMBOL` 行。`atr_value` 列にATR値が入る） |
+| `ATR_BUFFER_COPY_FAIL` | ATRバッファ取得失敗。フィルタはスキップして処理続行（`ERROR` 行） |
 | `EA_START` | EA起動（INIT イベント） |
 
 ### session_state の読み方
