@@ -1,9 +1,9 @@
 //+------------------------------------------------------------------+
 //|                                               SimpleScalper.mq5  |
-//|                        USDJPY専用 MAクロス スキャルピングEA       |
+//|                        マルチ通貨対応 MAクロス スキャルピングEA   |
 //+------------------------------------------------------------------+
 #property copyright "SimpleScalper"
-#property version   "1.03"
+#property version   "1.04"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -19,7 +19,7 @@ enum ENUM_LOT_MODE
 };
 
 //--- 入力パラメータ
-input string   InpSymbol       = "USDJPY";    // 取引通貨ペア（変更不可）
+input string   InpSymbol       = "";           // 取引通貨ペア（空欄=チャートのシンボル, 明示指定も可）
 input int      InpMagicNumber  = 20240001;    // マジックナンバー
 
 //--- ロット設定
@@ -64,6 +64,7 @@ input int             HigherSlowMAPeriod          = 50;         // 上位足 長
 input bool  EnableBreakoutStrategy   = true; // ブレイクアウト戦略を有効にする
 input int   BreakoutLookbackBars     = 20;   // ブレイクアウト判定の参照バー数（確定足）
 input int   BreakoutBufferPoints     = 2;    // ブレイクアウトバッファ（ポイント）
+input bool  BreakoutConfirmByClose   = true; // 終値確定版を使用する（true=精度優先, false=Ask/Bid）
 
 //--- 取引回数制限（安全弁）
 input int   DailyMaxTrades           = 10;  // 1日の最大取引回数（0=無制限, JSTベース）
@@ -84,6 +85,7 @@ CTrade  Trade;
 int     g_shortMaHandle = INVALID_HANDLE;
 int     g_longMaHandle  = INVALID_HANDLE;
 CLogger g_logger;
+string  g_symbol        = "";    // 稼働シンボル（InpSymbol 空欄時は _Symbol を使用）
 
 // スプレッドクールダウン
 datetime g_cooldownUntil   = 0;
@@ -189,7 +191,7 @@ int CountPositions()
     {
         ulong ticket = PositionGetTicket(i);
         if (ticket == 0) continue;
-        if (PositionGetString(POSITION_SYMBOL) == InpSymbol &&
+        if (PositionGetString(POSITION_SYMBOL) == g_symbol &&
             PositionGetInteger(POSITION_MAGIC) == InpMagicNumber)
             count++;
     }
@@ -206,7 +208,7 @@ void ClosePositionsByType(ENUM_POSITION_TYPE posType,
     {
         ulong ticket = PositionGetTicket(i);
         if (ticket == 0) continue;
-        if (PositionGetString(POSITION_SYMBOL) == InpSymbol &&
+        if (PositionGetString(POSITION_SYMBOL) == g_symbol &&
             PositionGetInteger(POSITION_MAGIC) == InpMagicNumber &&
             (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) == posType)
         {
@@ -237,9 +239,9 @@ double CalcLot(double slPoints)
     // リスク%ベースのロット計算
     double balance  = AccountInfoDouble(ACCOUNT_BALANCE);
     double riskAmt  = balance * InpRiskPercent / 100.0;
-    double tickVal  = SymbolInfoDouble(InpSymbol, SYMBOL_TRADE_TICK_VALUE);
-    double tickSize = SymbolInfoDouble(InpSymbol, SYMBOL_TRADE_TICK_SIZE);
-    double point    = SymbolInfoDouble(InpSymbol, SYMBOL_POINT);
+    double tickVal  = SymbolInfoDouble(g_symbol, SYMBOL_TRADE_TICK_VALUE);
+    double tickSize = SymbolInfoDouble(g_symbol, SYMBOL_TRADE_TICK_SIZE);
+    double point    = SymbolInfoDouble(g_symbol, SYMBOL_POINT);
 
     if (tickVal <= 0 || tickSize <= 0 || slPoints <= 0)
     {
@@ -254,9 +256,9 @@ double CalcLot(double slPoints)
     double lot        = (lossPerLot > 0) ? riskAmt / lossPerLot : InpMinLot;
 
     // ブローカーのボリューム制限に合わせて正規化
-    double volStep = SymbolInfoDouble(InpSymbol, SYMBOL_VOLUME_STEP);
-    double volMin  = SymbolInfoDouble(InpSymbol, SYMBOL_VOLUME_MIN);
-    double volMax  = SymbolInfoDouble(InpSymbol, SYMBOL_VOLUME_MAX);
+    double volStep = SymbolInfoDouble(g_symbol, SYMBOL_VOLUME_STEP);
+    double volMin  = SymbolInfoDouble(g_symbol, SYMBOL_VOLUME_MIN);
+    double volMax  = SymbolInfoDouble(g_symbol, SYMBOL_VOLUME_MAX);
 
     if (volStep > 0)
         lot = MathFloor(lot / volStep) * volStep;
@@ -282,19 +284,19 @@ void CheckTimeExit()
 {
     if (InpMaxBarsInTrade <= 0) return;
 
-    double point = SymbolInfoDouble(InpSymbol, SYMBOL_POINT);
+    double point = SymbolInfoDouble(g_symbol, SYMBOL_POINT);
     for (int i = PositionsTotal() - 1; i >= 0; i--)
     {
         ulong ticket = PositionGetTicket(i);
         if (ticket == 0) continue;
-        if (PositionGetString(POSITION_SYMBOL) != InpSymbol) continue;
+        if (PositionGetString(POSITION_SYMBOL) != g_symbol) continue;
         if (PositionGetInteger(POSITION_MAGIC) != InpMagicNumber) continue;
 
         // ポジション方向を先に取得（Close後は参照不可）
         ENUM_POSITION_TYPE posTypeForLog = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
 
         datetime openTime    = (datetime)PositionGetInteger(POSITION_TIME);
-        int      barsElapsed = iBarShift(InpSymbol, PERIOD_CURRENT, openTime, false);
+        int      barsElapsed = iBarShift(g_symbol, PERIOD_CURRENT, openTime, false);
         if (barsElapsed < 0) continue; // iBarShiftエラー時はスキップ
         if (barsElapsed < InpMaxBarsInTrade) continue;
 
@@ -363,12 +365,13 @@ string DealReasonToString(ENUM_DEAL_REASON reason)
 //+------------------------------------------------------------------+
 int OnInit()
 {
-    // 通貨ペアチェック
-    if (Symbol() != InpSymbol)
-    {
-        Alert("このEAは " + InpSymbol + " 専用です。チャートを " + InpSymbol + " に変更してください。");
-        return INIT_FAILED;
-    }
+    // 稼働シンボルを確定（InpSymbol が空欄ならチャートのシンボルを使用）
+    g_symbol = (InpSymbol == "") ? _Symbol : InpSymbol;
+
+    // 稼働シンボルがチャートと一致しているか確認（警告のみ、強制停止しない）
+    if (g_symbol != _Symbol)
+        Print("SimpleScalper: チャートシンボル(", _Symbol, ")と稼働シンボル(", g_symbol,
+              ")が異なります。意図的な設定であればこのメッセージは無視してください。");
 
     // パラメータ検証
     if (InpShortMaPeriod >= InpLongMaPeriod)
@@ -393,8 +396,8 @@ int OnInit()
     }
 
     // MAインジケータ初期化
-    g_shortMaHandle = iMA(InpSymbol, PERIOD_CURRENT, InpShortMaPeriod, 0, InpMaMethod, PRICE_CLOSE);
-    g_longMaHandle  = iMA(InpSymbol, PERIOD_CURRENT, InpLongMaPeriod,  0, InpMaMethod, PRICE_CLOSE);
+    g_shortMaHandle = iMA(g_symbol, PERIOD_CURRENT, InpShortMaPeriod, 0, InpMaMethod, PRICE_CLOSE);
+    g_longMaHandle  = iMA(g_symbol, PERIOD_CURRENT, InpLongMaPeriod,  0, InpMaMethod, PRICE_CLOSE);
 
     if (g_shortMaHandle == INVALID_HANDLE || g_longMaHandle == INVALID_HANDLE)
     {
@@ -411,8 +414,8 @@ int OnInit()
                   " FastMA=", HigherFastMAPeriod, " SlowMA=", HigherSlowMAPeriod);
             return INIT_FAILED;
         }
-        g_htfFastMaHandle = iMA(InpSymbol, HigherTimeframe, HigherFastMAPeriod, 0, InpMaMethod, PRICE_CLOSE);
-        g_htfSlowMaHandle = iMA(InpSymbol, HigherTimeframe, HigherSlowMAPeriod, 0, InpMaMethod, PRICE_CLOSE);
+        g_htfFastMaHandle = iMA(g_symbol, HigherTimeframe, HigherFastMAPeriod, 0, InpMaMethod, PRICE_CLOSE);
+        g_htfSlowMaHandle = iMA(g_symbol, HigherTimeframe, HigherSlowMAPeriod, 0, InpMaMethod, PRICE_CLOSE);
         if (g_htfFastMaHandle == INVALID_HANDLE || g_htfSlowMaHandle == INVALID_HANDLE)
         {
             Alert("上位足MAインジケータの初期化に失敗しました。");
@@ -425,7 +428,7 @@ int OnInit()
 
     // ロガー初期化
     g_logger.Init(EnableCsvLogging, EnablePrintLogging, LogLevel,
-                  LogFileName, InpSymbol, PERIOD_CURRENT,
+                  LogFileName, g_symbol, PERIOD_CURRENT,
                   InpShortMaPeriod, InpLongMaPeriod);
 
     // 起動時時刻ログ
@@ -435,7 +438,8 @@ int OnInit()
     string lotInfo = (InpLotMode == LOT_FIXED)
                      ? ("FixedLot:" + DoubleToString(InpLotSize, 2))
                      : ("RiskPercent:" + DoubleToString(InpRiskPercent, 2) + "%");
-    Print("SimpleScalper 初期化完了 | Magic:", InpMagicNumber,
+    Print("SimpleScalper 初期化完了 | Symbol:", g_symbol,
+          " | Magic:", InpMagicNumber,
           " | LotMode:", (InpLotMode == LOT_FIXED ? "Fixed" : "RiskPercent"),
           " | ", lotInfo,
           " | TP:", InpTakeProfit, " | SL:", InpStopLoss,
@@ -443,6 +447,7 @@ int OnInit()
           " | SpreadCooldown:", (EnableSpreadCooldown ? "ON" : "OFF"),
           " | HTFFilter:", (EnableHigherTimeframeFilter ? "ON" : "OFF"),
           " | Breakout:", (EnableBreakoutStrategy ? "ON" : "OFF"),
+          " | BreakoutConfirmByClose:", (BreakoutConfirmByClose ? "ON" : "OFF"),
           " | DailyMaxTrades:", DailyMaxTrades,
           " | MinMinutesBetweenEntries:", MinMinutesBetweenEntries);
     Print("時刻情報 | Server:", TimeToString(serverNow, TIME_DATE|TIME_MINUTES),
@@ -488,7 +493,7 @@ void OnTick()
 {
     // 新しいバーの開始時のみ処理
     static datetime lastBarTime = 0;
-    datetime currentBarTime = iTime(InpSymbol, PERIOD_CURRENT, 0);
+    datetime currentBarTime = iTime(g_symbol, PERIOD_CURRENT, 0);
     if (currentBarTime == lastBarTime) return;
     lastBarTime = currentBarTime;
 
@@ -507,9 +512,9 @@ void OnTick()
     CheckTimeExit();
 
     // 価格情報取得
-    double point  = SymbolInfoDouble(InpSymbol, SYMBOL_POINT);
-    double ask    = SymbolInfoDouble(InpSymbol, SYMBOL_ASK);
-    double bid    = SymbolInfoDouble(InpSymbol, SYMBOL_BID);
+    double point  = SymbolInfoDouble(g_symbol, SYMBOL_POINT);
+    double ask    = SymbolInfoDouble(g_symbol, SYMBOL_ASK);
+    double bid    = SymbolInfoDouble(g_symbol, SYMBOL_BID);
     int    spread = (point > 0) ? (int)MathRound((ask - bid) / point) : 0;
 
     // 取引時間帯チェック（GetSessionState()も含めて1回だけ評価）
@@ -533,9 +538,9 @@ void OnTick()
         datetime serverNow = TimeCurrent();
         datetime jstNow    = ServerTimeToJST(serverNow);
         Print("=== 新バー判定 | JST:", TimeToString(jstNow, TIME_DATE|TIME_MINUTES),
-              " | ", InpSymbol,
-              " | Bid:", DoubleToString(bid, (int)SymbolInfoInteger(InpSymbol, SYMBOL_DIGITS)),
-              " | Ask:", DoubleToString(ask, (int)SymbolInfoInteger(InpSymbol, SYMBOL_DIGITS)),
+              " | ", g_symbol,
+              " | Bid:", DoubleToString(bid, (int)SymbolInfoInteger(g_symbol, SYMBOL_DIGITS)),
+              " | Ask:", DoubleToString(ask, (int)SymbolInfoInteger(g_symbol, SYMBOL_DIGITS)),
               " | Spread:", spread, "pts",
               " | 取引時間帯:", (inTradeTime ? "YES" : "NO"),
               " | セッション:", sessionState);
@@ -656,7 +661,8 @@ void OnTick()
     SStrategySignal boSig;
     if (EnableBreakoutStrategy)
     {
-        boSig = EvaluateBreakout(InpSymbol, BreakoutLookbackBars, BreakoutBufferPoints);
+        boSig = EvaluateBreakout(g_symbol, BreakoutLookbackBars, BreakoutBufferPoints,
+                                  BreakoutConfirmByClose);
         if (boSig.error)
         {
             if (VerboseLog)
@@ -682,8 +688,9 @@ void OnTick()
                           " | HighestHigh:", DoubleToString(boSig.boHighestHigh, 5),
                           " | LowestLow:", DoubleToString(boSig.boLowestLow, 5),
                           " | Buffer:", DoubleToString(BreakoutBufferPoints * point, 5),
-                          " | Ask:", DoubleToString(ask, (int)SymbolInfoInteger(InpSymbol, SYMBOL_DIGITS)),
-                          " | Bid:", DoubleToString(bid, (int)SymbolInfoInteger(InpSymbol, SYMBOL_DIGITS)),
+                          " | Ask:", DoubleToString(ask, (int)SymbolInfoInteger(g_symbol, SYMBOL_DIGITS)),
+                          " | Bid:", DoubleToString(bid, (int)SymbolInfoInteger(g_symbol, SYMBOL_DIGITS)),
+                          " | ConfirmByClose:", (BreakoutConfirmByClose ? "YES" : "NO"),
                           " | Signal:", boSig.signal);
 
                 SLogEntry e;
@@ -880,13 +887,31 @@ void OnTick()
     {
         ClosePositionsByType(POSITION_TYPE_SELL);
 
-        if (CountPositions() < InpMaxPositions)
+        // 保有中は新規禁止（同一シンボル・同一MagicNumberでポジションがあればスキップ）
+        if (CountPositions() > 0)
+        {
+            if (VerboseLog)
+                Print("エントリー見送り | 理由: ポジション保有中 | BUY | ポジション数:", CountPositions());
+
+            SLogEntry e;
+            e.event_type    = "SKIP_SYMBOL";
+            e.side          = "BUY";
+            e.reason        = "POSITION_ALREADY_OPEN";
+            e.fast_ma_value = maSig.shortMaCurr;
+            e.slow_ma_value = maSig.longMaCurr;
+            e.price_bid     = bid;
+            e.price_ask     = ask;
+            e.spread_points = spread;
+            e.session_state = sessionState;
+            g_logger.LogEvent(LOG_LEVEL_TRADES, e);
+        }
+        else if (CountPositions() < InpMaxPositions)
         {
             double sl  = ask - InpStopLoss   * point;
             double tp  = ask + InpTakeProfit * point;
             double lot = CalcLot(InpStopLoss);
             double margin = 0;
-            if (!OrderCalcMargin(ORDER_TYPE_BUY, InpSymbol, lot, ask, margin) ||
+            if (!OrderCalcMargin(ORDER_TYPE_BUY, g_symbol, lot, ask, margin) ||
                 AccountInfoDouble(ACCOUNT_FREEMARGIN) < margin)
             {
                 if (VerboseLog)
@@ -909,14 +934,14 @@ void OnTick()
             }
             else
             {
-                bool ok = Trade.Buy(lot, InpSymbol, ask, sl, tp, "SimpleScalper Buy");
+                bool ok = Trade.Buy(lot, g_symbol, ask, sl, tp, "SimpleScalper Buy");
                 if (ok)
                 {
                     g_dailyTradeCount++;
                     g_lastEntryTime = TimeCurrent();
-                    Print("エントリー実行 | BUY | Ask:", DoubleToString(ask, (int)SymbolInfoInteger(InpSymbol, SYMBOL_DIGITS)),
-                          " | SL:", DoubleToString(sl, (int)SymbolInfoInteger(InpSymbol, SYMBOL_DIGITS)),
-                          " | TP:", DoubleToString(tp, (int)SymbolInfoInteger(InpSymbol, SYMBOL_DIGITS)),
+                    Print("エントリー実行 | BUY | Ask:", DoubleToString(ask, (int)SymbolInfoInteger(g_symbol, SYMBOL_DIGITS)),
+                          " | SL:", DoubleToString(sl, (int)SymbolInfoInteger(g_symbol, SYMBOL_DIGITS)),
+                          " | TP:", DoubleToString(tp, (int)SymbolInfoInteger(g_symbol, SYMBOL_DIGITS)),
                           " | Lot:", DoubleToString(lot, 2),
                           " | Strategy:", entryReason);
                 }
@@ -952,13 +977,31 @@ void OnTick()
     {
         ClosePositionsByType(POSITION_TYPE_BUY);
 
-        if (CountPositions() < InpMaxPositions)
+        // 保有中は新規禁止（同一シンボル・同一MagicNumberでポジションがあればスキップ）
+        if (CountPositions() > 0)
+        {
+            if (VerboseLog)
+                Print("エントリー見送り | 理由: ポジション保有中 | SELL | ポジション数:", CountPositions());
+
+            SLogEntry e;
+            e.event_type    = "SKIP_SYMBOL";
+            e.side          = "SELL";
+            e.reason        = "POSITION_ALREADY_OPEN";
+            e.fast_ma_value = maSig.shortMaCurr;
+            e.slow_ma_value = maSig.longMaCurr;
+            e.price_bid     = bid;
+            e.price_ask     = ask;
+            e.spread_points = spread;
+            e.session_state = sessionState;
+            g_logger.LogEvent(LOG_LEVEL_TRADES, e);
+        }
+        else if (CountPositions() < InpMaxPositions)
         {
             double sl  = bid + InpStopLoss   * point;
             double tp  = bid - InpTakeProfit * point;
             double lot = CalcLot(InpStopLoss);
             double margin = 0;
-            if (!OrderCalcMargin(ORDER_TYPE_SELL, InpSymbol, lot, bid, margin) ||
+            if (!OrderCalcMargin(ORDER_TYPE_SELL, g_symbol, lot, bid, margin) ||
                 AccountInfoDouble(ACCOUNT_FREEMARGIN) < margin)
             {
                 if (VerboseLog)
@@ -981,14 +1024,14 @@ void OnTick()
             }
             else
             {
-                bool ok = Trade.Sell(lot, InpSymbol, bid, sl, tp, "SimpleScalper Sell");
+                bool ok = Trade.Sell(lot, g_symbol, bid, sl, tp, "SimpleScalper Sell");
                 if (ok)
                 {
                     g_dailyTradeCount++;
                     g_lastEntryTime = TimeCurrent();
-                    Print("エントリー実行 | SELL | Bid:", DoubleToString(bid, (int)SymbolInfoInteger(InpSymbol, SYMBOL_DIGITS)),
-                          " | SL:", DoubleToString(sl, (int)SymbolInfoInteger(InpSymbol, SYMBOL_DIGITS)),
-                          " | TP:", DoubleToString(tp, (int)SymbolInfoInteger(InpSymbol, SYMBOL_DIGITS)),
+                    Print("エントリー実行 | SELL | Bid:", DoubleToString(bid, (int)SymbolInfoInteger(g_symbol, SYMBOL_DIGITS)),
+                          " | SL:", DoubleToString(sl, (int)SymbolInfoInteger(g_symbol, SYMBOL_DIGITS)),
+                          " | TP:", DoubleToString(tp, (int)SymbolInfoInteger(g_symbol, SYMBOL_DIGITS)),
                           " | Lot:", DoubleToString(lot, 2),
                           " | Strategy:", entryReason);
                 }
@@ -1035,7 +1078,7 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
 
     // このEAのマジックナンバーと通貨ペアに限定
     if ((long)HistoryDealGetInteger(trans.deal, DEAL_MAGIC) != InpMagicNumber) return;
-    if (HistoryDealGetString(trans.deal, DEAL_SYMBOL) != InpSymbol) return;
+    if (HistoryDealGetString(trans.deal, DEAL_SYMBOL) != g_symbol) return;
 
     // クローズ（OUT）または部分決済（INOUT）のみ対象
     ENUM_DEAL_ENTRY dealEntry = (ENUM_DEAL_ENTRY)HistoryDealGetInteger(trans.deal, DEAL_ENTRY);
