@@ -27,6 +27,9 @@ MT5（MetaTrader 5）用のスキャルピングEAです。
 ATRフィルタ（有効時）
   └── ATR < MinATRPoints → 見送り（ATR_TOO_LOW）
           ↓ 通過した場合のみ
+ADXフィルタ（有効時）
+  └── ADX < MinADX → 見送り（ADX_TOO_LOW）
+          ↓ 通過した場合のみ
 取引回数制限（安全弁）
   ├── DailyMaxTrades（日次上限）
   └── MinMinutesBetweenEntries（間隔制限）
@@ -190,6 +193,51 @@ ATR(ATRTimeframe, ATRPeriod)[直近確定足（bar 1）] / Point < MinATRPoints 
 #### `EnableATRFilter=false`（デフォルト）の挙動
 
 ATRフィルタは完全にスキップされます。ATR計算も行われないため、以前のバージョンとまったく同じ挙動になります（後方互換）。
+
+### ADXフィルタ（レンジ相場・MAクロスだまし回避）
+
+| パラメータ | デフォルト | 説明 |
+|-----------|-----------|------|
+| `EnableADXFilter` | `false` | ADXフィルタを有効にする。**デフォルト OFF**（後方互換）。`true` にするとトレンドが弱いレンジ相場のエントリーを抑制する |
+| `ADXTimeframe` | `PERIOD_CURRENT` | ADX計算に使用するタイムフレーム。`PERIOD_CURRENT` でチャートと同じ足 |
+| `ADXPeriod` | `14` | ADX計算期間（本数） |
+| `MinADX` | `20.0` | エントリーを許可する最小ADX値。直近確定足（bar 1）のADXがこの値**未満**のバーはエントリーを見送る |
+
+#### 判定ロジック
+
+集約後のシグナルが BUY または SELL の場合のみ評価します（NONE の場合はチェックしない）。ATRフィルタ通過後に適用されます。
+
+```
+iADX(g_symbol, ADXTimeframe, ADXPeriod)[直近確定足（bar 1）]メインライン < MinADX  →  見送り（ADX_TOO_LOW）
+```
+
+> **MT5 インデックスの補足**: `bar 1` は「1本前の確定済み足」（現在形成中の `bar 0` の1つ前）を指します。実装では `CopyBuffer(handle, 0, 1, 1, buf)` の第3引数（shift=1）が bar 1 に対応します。第2引数（buffer_index=0）は ADX のメインライン（+DI／-DI ではなく ADX そのもの）を指定しています。ADX値は直近確定足時点のものを使用します。
+
+#### M15運用での推奨初期値（USDJPY 目安）
+
+| ADXの目安 | MinADX の推奨値 | 備考 |
+|-----------|----------------|------|
+| レンジを幅広く除外したい（控えめ） | `18` | 取引回数の減少は比較的少ない |
+| M15 標準的なフィルタ（**推奨**） | `20` | デフォルト値。弱いトレンドの横ばい局面を概ねカット |
+| 強トレンドのみ狙いたい（厳しめ） | `22`〜`25` | 取引回数は減るがシグナル品質は上がりやすい |
+
+> **推奨調整レンジ**: `MinADX = 18`〜`25`（M15・USDJPY運用の目安）。  
+> 取引が減りすぎる場合は `18` へ、まだダマシが多い場合は `22`〜`25` へ調整してください。  
+> `ADXTimeframe` を `PERIOD_H1` に変更すると上位足トレンド強度での判定も可能ですが、取引回数はさらに減少します。
+
+#### エラー時の挙動（安全側）
+
+ADXフィルタが有効（`EnableADXFilter=true`）のとき、以下の場合は**安全側**として新規エントリーを見送ります。
+
+| 状況 | event_type | reason |
+|------|-----------|--------|
+| ハンドルが無効（`INVALID_HANDLE`） | `SKIP_SYMBOL` | `ADX_HANDLE_FAIL` |
+| `CopyBuffer` 取得失敗 | `SKIP_SYMBOL` | `ADX_BUFFER_COPY_FAIL` |
+| ADX < MinADX | `SKIP_SYMBOL` | `ADX_TOO_LOW` |
+
+#### `EnableADXFilter=false`（デフォルト）の挙動
+
+ADXフィルタは完全にスキップされます。ADX計算も行われないため、以前のバージョンとまったく同じ挙動になります（後方互換）。
 
 ### 取引回数制限（安全弁）
 
@@ -437,6 +485,7 @@ SimpleScalper 初期化完了 | Magic:20240001 | LotMode:RiskPercent | RiskPerce
 | `htf_slow_ma_value` | 上位足 長期MA値（HTFフィルタ有効時のスキップ行に出力） |
 | `htf_trend` | 上位足トレンド方向（`UP` / `DOWN` / `FLAT`）（HTFフィルタ有効時のスキップ行に出力） |
 | `atr_value` | ATR値（ポイント換算）。`ATR_TOO_LOW` スキップ行のみ設定。それ以外は空 |
+| `adx_value` | ADX値。`ADX_TOO_LOW` スキップ行のみ設定。それ以外は空 |
 
 ### event_type 一覧
 
@@ -486,6 +535,9 @@ SimpleScalper 初期化完了 | Magic:20240001 | LotMode:RiskPercent | RiskPerce
 | `CLOSE_PRICE_COPY_FAIL` | ブレイクアウト終値確定版の終値バッファ取得失敗 |
 | `ATR_TOO_LOW` | ATRが `MinATRPoints` 未満のため低ボラ相場として見送り（`SKIP_SYMBOL` 行。`atr_value` 列にATR値が入る） |
 | `ATR_BUFFER_COPY_FAIL` | ATRバッファ取得失敗。フィルタはスキップして処理続行（`ERROR` 行） |
+| `ADX_TOO_LOW` | ADXが `MinADX` 未満のためレンジ相場として見送り（`SKIP_SYMBOL` 行。`adx_value` 列にADX値が入る） |
+| `ADX_BUFFER_COPY_FAIL` | ADXバッファ取得失敗。安全側としてエントリー見送り（`SKIP_SYMBOL` 行） |
+| `ADX_HANDLE_FAIL` | ADXハンドルが無効。安全側としてエントリー見送り（`SKIP_SYMBOL` 行） |
 | `EA_START` | EA起動（INIT イベント） |
 
 ### session_state の読み方

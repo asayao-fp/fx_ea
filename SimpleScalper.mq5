@@ -72,6 +72,12 @@ input ENUM_TIMEFRAMES ATRTimeframe     = PERIOD_CURRENT; // ATRフィルタ用�
 input int             ATRPeriod        = 14;            // ATR計算期間
 input int             MinATRPoints     = 20;            // 最小ATR閾値（ポイント）。これ未満のバーはエントリーを見送る
 
+//--- ADXフィルタ（レンジ相場・MAクロスだまし回避）
+input bool            EnableADXFilter  = false;         // ADXフィルタを有効にする（デフォルトOFF＝後方互換）
+input ENUM_TIMEFRAMES ADXTimeframe     = PERIOD_CURRENT; // ADXフィルタ用タイムフレーム
+input int             ADXPeriod        = 14;            // ADX計算期間
+input double          MinADX           = 20.0;          // 最小ADX閾値。これ未満のバーはエントリーを見送る
+
 //--- 取引回数制限（安全弁）
 input int   DailyMaxTrades           = 10;  // 1日の最大取引回数（0=無制限, JSTベース）
 input int   MinMinutesBetweenEntries = 5;   // エントリー間隔の最小時間（分, 0=無制限）
@@ -102,6 +108,9 @@ int      g_htfSlowMaHandle = INVALID_HANDLE;
 
 // ATRハンドル
 int      g_atrHandle       = INVALID_HANDLE;
+
+// ADXハンドル
+int      g_adxHandle       = INVALID_HANDLE;
 
 // 取引回数管理（JSTベース日次カウント）
 int      g_dailyTradeCount = 0;          // 本日の取引回数
@@ -448,6 +457,22 @@ int OnInit()
         }
     }
 
+    // ADXハンドル初期化
+    if (EnableADXFilter)
+    {
+        if (ADXPeriod <= 0)
+        {
+            Alert("ADXフィルタ: ADXPeriodは正の値を設定してください。");
+            return INIT_FAILED;
+        }
+        g_adxHandle = iADX(g_symbol, ADXTimeframe, ADXPeriod);
+        if (g_adxHandle == INVALID_HANDLE)
+        {
+            Alert("ADXインジケータの初期化に失敗しました。");
+            return INIT_FAILED;
+        }
+    }
+
     Trade.SetExpertMagicNumber(InpMagicNumber);
     Trade.SetDeviationInPoints(10);
 
@@ -475,6 +500,8 @@ int OnInit()
           " | BreakoutConfirmByClose:", (BreakoutConfirmByClose ? "ON" : "OFF"),
           " | ATRFilter:", (EnableATRFilter ? "ON" : "OFF"),
           " | MinATRPoints:", MinATRPoints,
+          " | ADXFilter:", (EnableADXFilter ? "ON" : "OFF"),
+          " | MinADX:", MinADX,
           " | DailyMaxTrades:", DailyMaxTrades,
           " | MinMinutesBetweenEntries:", MinMinutesBetweenEntries);
     Print("時刻情報 | Server:", TimeToString(serverNow, TIME_DATE|TIME_MINUTES),
@@ -511,6 +538,7 @@ void OnDeinit(const int reason)
     if (g_htfFastMaHandle != INVALID_HANDLE) IndicatorRelease(g_htfFastMaHandle);
     if (g_htfSlowMaHandle != INVALID_HANDLE) IndicatorRelease(g_htfSlowMaHandle);
     if (g_atrHandle       != INVALID_HANDLE) IndicatorRelease(g_atrHandle);
+    if (g_adxHandle       != INVALID_HANDLE) IndicatorRelease(g_adxHandle);
     g_logger.Deinit();
 }
 
@@ -910,6 +938,67 @@ void OnTick()
                 g_logger.LogEvent(LOG_LEVEL_TRADES, e);
                 return;
             }
+        }
+    }
+
+    // --- ADXフィルタ（レンジ相場・MAクロスだまし回避） ---
+    // ここに到達した時点で finalBuy || finalSell が保証されている（NONEは上の return で抜けている）
+    // EnableADXFilter=false のとき完全スキップ（後方互換）
+    if (EnableADXFilter)
+    {
+        if (g_adxHandle == INVALID_HANDLE)
+        {
+            // ハンドル無効: 安全側としてエントリー見送り
+            Print("ADXハンドルが無効です | reason:ADX_HANDLE_FAIL | error:", GetLastError());
+            SLogEntry e;
+            e.event_type    = "SKIP_SYMBOL";
+            e.side          = finalBuy ? "BUY" : "SELL";
+            e.reason        = "ADX_HANDLE_FAIL";
+            e.last_error    = GetLastError();
+            e.price_bid     = bid;
+            e.price_ask     = ask;
+            e.spread_points = spread;
+            e.session_state = sessionState;
+            g_logger.LogEvent(LOG_LEVEL_TRADES, e);
+            return;
+        }
+
+        double adxBuf[1];
+        if (CopyBuffer(g_adxHandle, 0, 1, 1, adxBuf) < 1)
+        {
+            // バッファ取得失敗: 安全側としてエントリー見送り
+            Print("ADXバッファ取得失敗 | reason:ADX_BUFFER_COPY_FAIL | error:", GetLastError());
+            SLogEntry e;
+            e.event_type    = "SKIP_SYMBOL";
+            e.side          = finalBuy ? "BUY" : "SELL";
+            e.reason        = "ADX_BUFFER_COPY_FAIL";
+            e.last_error    = GetLastError();
+            e.price_bid     = bid;
+            e.price_ask     = ask;
+            e.spread_points = spread;
+            e.session_state = sessionState;
+            g_logger.LogEvent(LOG_LEVEL_TRADES, e);
+            return;
+        }
+
+        double adxValue = adxBuf[0];
+        if (adxValue < MinADX)
+        {
+            if (VerboseLog)
+                Print("エントリー見送り | 理由: ADX低すぎ | ADX:", DoubleToString(adxValue, 1),
+                      " < 最小:", DoubleToString(MinADX, 1));
+
+            SLogEntry e;
+            e.event_type    = "SKIP_SYMBOL";
+            e.side          = finalBuy ? "BUY" : "SELL";
+            e.reason        = "ADX_TOO_LOW";
+            e.price_bid     = bid;
+            e.price_ask     = ask;
+            e.spread_points = spread;
+            e.adx_value     = adxValue;
+            e.session_state = sessionState;
+            g_logger.LogEvent(LOG_LEVEL_TRADES, e);
+            return;
         }
     }
 
