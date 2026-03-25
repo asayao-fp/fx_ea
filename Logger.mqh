@@ -22,7 +22,7 @@
    "order_ticket,position_ticket,deal_ticket,retcode,last_error,session_state," \
    "deal_reason,profit,commission,swap,deal_price," \
    "cooldown_until,htf_fast_ma_value,htf_slow_ma_value,htf_trend," \
-   "atr_value"
+   "atr_value,adx_value"
 
 //+------------------------------------------------------------------+
 //| ログエントリ構造体                                                |
@@ -63,6 +63,9 @@ struct SLogEntry
    // ATRフィルタ
    double atr_value;           // ATR値（ポイント換算。ATR_TOO_LOW スキップ行に設定）
 
+   // ADXフィルタ
+   double adx_value;           // ADX値（ADX_TOO_LOW スキップ行に設定）
+
    SLogEntry()
    {
       event_type    = "";
@@ -92,6 +95,7 @@ struct SLogEntry
       htf_slow_ma_value = 0.0;
       htf_trend         = "";
       atr_value         = 0.0;
+      adx_value         = 0.0;
    }
 };
 
@@ -167,7 +171,8 @@ private:
       row += FormatDbl(e.htf_fast_ma_value)                                    + ",";
       row += FormatDbl(e.htf_slow_ma_value)                                    + ",";
       row += e.htf_trend                                                        + ",";
-      row += FormatDbl(e.atr_value, 2);
+      row += FormatDbl(e.atr_value, 2)                                          + ",";
+      row += FormatDbl(e.adx_value, 2);
       return row;
    }
 
@@ -225,6 +230,8 @@ private:
       }
       if (e.atr_value > 0.0)
          msg += " atr=" + DoubleToString(e.atr_value, 2) + "pts";
+      if (e.adx_value > 0.0)
+         msg += " adx=" + DoubleToString(e.adx_value, 2);
       return msg;
    }
 
